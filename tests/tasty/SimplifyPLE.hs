@@ -33,7 +33,7 @@ simplify' = PLE.simplify emptyKnowledge emptyICtx
       ICtx
         { icAssms = S.empty, -- S.HashSet Pred
           icCands = S.empty, -- :: S.HashSet Expr
-          icEquals = S.empty, -- :: EvAccum
+          icEquals = SM.empty, -- :: EvAccum
           icSolved = S.empty, -- :: S.HashSet Expr
           icSimpl = SM.empty, -- :: !ConstMap
           icSubcId = Nothing, -- :: Maybe SubcId

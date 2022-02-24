@@ -66,8 +66,8 @@ import           Text.PrettyPrint.HughesPJ.Compat
 mytracepp :: (PPrint a) => String -> a -> a
 mytracepp = notracepp
 
-traceE :: (Expr,Expr) -> (Expr,Expr)
-traceE (e,e')
+_traceE :: (Expr,Expr) -> (Expr,Expr)
+_traceE (e,e')
   | isEnabled
   , e /= e'
   = trace ("\n" ++ showpp e ++ " ~> " ++ showpp e') (e,e')
@@ -233,10 +233,7 @@ evalCandsLoop :: Config -> ICtx -> SMT.Context -> Knowledge -> EvalEnv -> IO ICt
 evalCandsLoop cfg ictx0 ctx γ env = go ictx0 0
   where
     withRewrites exprs =
-      let
-        rws = [rewrite e (knSims γ) | e <- S.toList (snd `S.map` exprs)]
-      in
-        exprs <> S.fromList (concat rws)
+      concat [ p : rewrite e (knSims γ) | p@(_, e) <- M.toList exprs ]
     go ictx _ | S.null (icCands ictx) = return ictx
     go ictx i =  do
                   let cands = icCands ictx
@@ -250,15 +247,16 @@ evalCandsLoop cfg ictx0 ctx γ env = go ictx0 0
                                -- foldM (\ictx e -> undefined)
                                -- mapM (evalOne γ env' ictx) (S.toList cands)
                   let us = mconcat evalResults
-                  if S.null (us `S.difference` icEquals ictx)
+                      mapEntryDiff e0 e1 = if e0 == e1 then Nothing else Just e0
+                  if M.null (M.differenceWith mapEntryDiff us (icEquals ictx))
                         then return ictx
-                        else do  let oks      = fst `S.map` us
+                        else do  let oks      = M.keysSet us
                                  let us'      = withRewrites us
-                                 let eqsSMT   = evalToSMT "evalCandsLoop" cfg ctx `S.map` us'
+                                 let eqsSMT   = evalToSMT "evalCandsLoop" cfg ctx `S.map` S.fromList us'
                                  let ictx''   = ictx' { icSolved = icSolved ictx <> oks
-                                                      , icEquals = icEquals ictx <> us'
+                                                      , icEquals = icEquals ictx <> M.fromList us'
                                                       , icAssms  = S.filter (not . isTautoPred) eqsSMT }
-                                 let newcands = mconcat (makeCandidates γ ictx'' <$> S.toList (cands <> (snd `S.map` us)))
+                                 let newcands = mconcat (makeCandidates γ ictx'' <$> S.toList (cands <> S.fromList (M.elems us)))
                                  go (ictx'' { icCands = S.fromList newcands}) (i + 1)
 
 evalOneCandStep :: Knowledge -> EvalEnv -> Int -> (ICtx, [EvAccum]) -> Expr -> IO (ICtx, [EvAccum])
@@ -339,7 +337,7 @@ initCtx :: InstEnv a -> [(Expr,Expr)] -> ICtx
 initCtx env es   = ICtx
   { icAssms  = mempty
   , icCands  = mempty
-  , icEquals = S.fromList es
+  , icEquals = M.fromList es
   , icSolved = mempty
   , icSimpl  = mempty
   , icSubcId = Nothing
@@ -347,8 +345,8 @@ initCtx env es   = ICtx
   , icANFs   = []
   }
 
-equalitiesPred :: S.HashSet (Expr, Expr) -> [Expr]
-equalitiesPred eqs = [ EEq e1 e2 | (e1, e2) <- S.toList eqs, e1 /= e2 ]
+equalitiesPred :: M.HashMap Expr Expr -> [Expr]
+equalitiesPred eqs = [ EEq e1 e2 | (e1, e2) <- M.toList eqs, e1 /= e2 ]
 
 updCtxRes :: InstRes -> Maybe BindId -> ICtx -> (ICtx, InstRes)
 updCtxRes res iMb ctx = (ctx, res')
@@ -370,14 +368,14 @@ updCtx InstEnv {..} ctx delta cidMb
               = ctx { icAssms  = S.fromList (filter (not . isTautoPred) ctxEqs)
                     , icCands  = S.fromList cands           <> icCands  ctx
                     , icEquals = initEqs                    <> icEquals ctx
-                    , icSimpl  = M.fromList (S.toList sims) <> icSimpl ctx <> econsts
+                    , icSimpl  = sims <> icSimpl ctx <> econsts
                     , icSubcId = cidMb
                     , icANFs   = bs : icANFs ctx
                     }
   where
-    initEqs   = S.fromList $ concat [rewrite e (knSims ieKnowl) | e  <- cands]
+    initEqs   = M.fromList $ concat [rewrite e (knSims ieKnowl) | e  <- cands]
     cands     = concatMap (makeCandidates ieKnowl ctx) (rhs:es)
-    sims      = S.filter (isSimplification (knDCs ieKnowl)) (initEqs <> icEquals ctx)
+    sims      = M.filter (isConstant (knDCs ieKnowl)) (initEqs <> icEquals ctx)
     econsts   = M.fromList $ findConstants ieKnowl es
     ctxEqs    = toSMT "updCtx" ieCfg ieSMT [] <$> L.nub (concat
                   [ equalitiesPred initEqs
@@ -442,7 +440,7 @@ getCstr env cid = Misc.safeLookup "Instantiate.getCstr" cid env
 isPleCstr :: AxiomEnv -> SubcId -> SimpC a -> Bool
 isPleCstr aenv sid c = isTarget c && M.lookupDefault False sid (aenvExpand aenv)
 
-type EvAccum = S.HashSet (Expr, Expr)
+type EvAccum = M.HashMap Expr Expr
 
 --------------------------------------------------------------------------------
 data EvalEnv = EvalEnv
@@ -478,7 +476,7 @@ getAutoRws γ ctx =
 evalOne :: Knowledge -> EvalEnv -> ICtx -> Int -> Expr -> IO (EvAccum, FuelCount)
 evalOne γ env ctx i e | i > 0 || null (getAutoRws γ ctx) = do
     ((e', _), st) <- runStateT (eval γ ctx NoRW e) (env { evFuel = icFuel ctx })
-    let evAcc' = if mytracepp ("evalOne: " ++ showpp e) e' == e then evAccum st else S.insert (e, e') (evAccum st)
+    let evAcc' = if mytracepp ("evalOne: " ++ showpp e) e' == e then evAccum st else M.insert e e' (evAccum st)
     return (evAcc', evFuel st)
 evalOne γ env ctx _ e = do
   env' <- execStateT (evalREST γ ctx rp) (env { evFuel = icFuel ctx })
@@ -616,15 +614,15 @@ eval _ ctx _ e
   = return (v, noExpand)
 
 eval γ ctx et e =
-  do acc <- gets (S.toList . evAccum)
-     case L.lookup e acc of
+  do acc <- gets evAccum
+     case M.lookup e acc of
         -- If rewriting, don't lookup, as evAccum may contain loops
         Just e' | null (getAutoRws γ ctx) -> eval γ ctx et e'
         _ -> do
           (e0', fe)  <- go e
           let e' = simplify γ ctx e0'
           when (e /= e' && et == NoRW) $
-            modify (\st -> st { evAccum = S.insert (traceE (e, e')) (evAccum st) })
+            modify (\st -> st { evAccum = M.insert e e' (evAccum st) })
           return (e', fe)
   where
     go (ELam (x,s) e)   = mapFE (ELam (x, s)) <$> eval γ' ctx et e where γ' = γ { knLams = (x, s) : knLams γ }
@@ -707,7 +705,7 @@ evalREST _ ctx rp
   | pathExprs <- map fst (mytracepp "EVAL1: path" $ path rp)
   , e         <- last pathExprs
   , Just v    <- M.lookup e (icSimpl ctx)
-  = when (v /= e) $ modify (\st -> st { evAccum = S.insert (e, v) (evAccum st)})
+  = when (v /= e) $ modify (\st -> st { evAccum = M.insert e v (evAccum st)})
 
 evalREST γ ctx rp =
   do
@@ -725,11 +723,11 @@ evalREST γ ctx rp =
 
       let evalIsNewExpr = e' `L.notElem` pathExprs
       let exprsToAdd    = [e' | evalIsNewExpr]  ++ map fst rws
-      let evAccum'      = S.fromList $ map (e,) exprsToAdd
+      let evAccum'      = M.fromList $ map (e,) exprsToAdd
 
       modify (\st ->
                 st {
-                  evAccum  = S.union evAccum' (evAccum st)
+                  evAccum  = M.union evAccum' (evAccum st)
                 , explored = Just $ ExploredTerms.insert
                   (Rewrite.convert e)
                   (c rp)
@@ -1007,9 +1005,6 @@ type ConstDCMap = [(Symbol, (Symbol, Expr))]
 -- ValueMap maps expressions to constants (including data constructors)
 type ConstMap = M.HashMap Expr Expr
 type LDataCon = Symbol              -- Data Constructors
-
-isSimplification :: S.HashSet LDataCon -> (Expr,Expr) -> Bool
-isSimplification dcs (_,c) = isConstant dcs c
 
 
 isConstant :: S.HashSet LDataCon -> Expr -> Bool
