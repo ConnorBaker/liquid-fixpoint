@@ -623,19 +623,10 @@ eval γ ctx et e =
         _ -> do
           (e0', fe)  <- go e
           let e' = simplify γ ctx e0'
-          if e /= e'
-            then
-              case et of
-                NoRW -> do
-                  modify (\st -> st { evAccum = S.insert (traceE (e, e')) (evAccum st) })
-                  (e'',  fe') <- eval γ (addConst (e,e') ctx) et e'
-                  return (e'', fe <|> fe')
-                _ -> return (e', fe)
-            else
-              return (e, fe)
+          when (e /= e' && et == NoRW) $
+            modify (\st -> st { evAccum = S.insert (traceE (e, e')) (evAccum st) })
+          return (e', fe)
   where
-    addConst (e,e') ctx = if isConstant (knDCs γ) e'
-                           then ctx { icSimpl = M.insert e e' $ icSimpl ctx} else ctx
     go (ELam (x,s) e)   = mapFE (ELam (x, s)) <$> eval γ' ctx et e where γ' = γ { knLams = (x, s) : knLams γ }
     go (EIte b e1 e2) = evalIte γ ctx et b e1 e2
     go (ECoerc s t e)   = mapFE (ECoerc s t)  <$> go e
