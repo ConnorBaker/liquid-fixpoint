@@ -10,7 +10,7 @@ packages:
 extra-deps:
   - hashable-1.3.5.0
   - git: https://github.com/ConnorBaker/rest
-    commit: 1e5ef5139f49326518c7d148eaf7848cb118151f
+    commit: 28890b264fde96bed89935d6f10a3acc203ab846
 
 nix:
   enable: true

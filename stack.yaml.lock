@@ -16,12 +16,12 @@ packages:
     version: 0.2.1
     git: https://github.com/ConnorBaker/rest
     pantry-tree:
-      size: 4369
-      sha256: c1aee91e4a8b96d020143b1bb0dc9b0545235cff22c0b2a964d26ad49d2143c7
-    commit: 1e5ef5139f49326518c7d148eaf7848cb118151f
+      size: 4370
+      sha256: 3a975d7c51ac3bf743c5375051264b3f92afc39a3e825860711c1e4418fb4674
+    commit: 28890b264fde96bed89935d6f10a3acc203ab846
   original:
     git: https://github.com/ConnorBaker/rest
-    commit: 1e5ef5139f49326518c7d148eaf7848cb118151f
+    commit: 28890b264fde96bed89935d6f10a3acc203ab846
 snapshots:
 - completed:
     size: 590100
