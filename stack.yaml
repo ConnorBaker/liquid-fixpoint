@@ -15,4 +15,6 @@ extra-deps:
 nix:
   enable: true
   pure: true
-  packages: [cacert z3]
+  packages:
+    - cacert
+    - z3
