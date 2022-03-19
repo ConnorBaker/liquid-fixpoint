@@ -15,7 +15,8 @@
     in
     {
       devShells.default = pkgs.mkShell {
-        packages = with pkgs; [stack];
+        packages = with pkgs; [ stack ];
+        NIX_PATH = "nixpkgs=${nixpkgs}";
       };
     });
 }
