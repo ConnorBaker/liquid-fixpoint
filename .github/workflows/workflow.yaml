@@ -25,6 +25,6 @@ jobs:
       - name: Setup
         run: nix develop --command -- stack setup --verbose
       - name: Build
-        run: nix develop --command -- stack build --pedantic --verbose
+        run: nix develop --command -- stack build --pedantic --verbose --ghc-options="-Wno-name-shadowing -Wno-orphans -Wno-type-defaults"
       - name: Test
-        run: nix develop --command -- stack test --pedantic --verbose
+        run: nix develop --command -- stack test --pedantic --verbose --ghc-options="-Wno-name-shadowing -Wno-orphans -Wno-type-defaults"
