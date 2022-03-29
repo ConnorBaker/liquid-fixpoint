@@ -1,0 +1,8 @@
+packages: .
+with-compiler: ghc-8.10.7
+jobs: $ncpus
+
+source-repository-package
+    type: git
+    location: https://github.com/ConnorBaker/rest
+    tag: eb12a7107ec98e2b06cf33777479148514aff4ce

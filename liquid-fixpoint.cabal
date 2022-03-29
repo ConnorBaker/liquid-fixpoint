@@ -1,4 +1,4 @@
-cabal-version:      2.4
+cabal-version:      3.6
 name:               liquid-fixpoint
 version:            0.8.10.7.1
 synopsis:           Predicate Abstraction-based Horn-Clause/Implication Constraint Solver
@@ -21,7 +21,7 @@ license-file:       LICENSE
 copyright:          2010-17 Ranjit Jhala, University of California, San Diego.
 author:             Ranjit Jhala, Niki Vazou, Eric Seidel
 maintainer:         jhala@cs.ucsd.edu
-tested-with:        GHC == 7.10.3, GHC == 8.0.1, GHC == 8.4.3, GHC == 8.6.4, GHC == 8.10.1, GHC == 8.10.7
+tested-with:        GHC == {7.10.3, 8.0.1, 8.4.3, 8.6.4, 8.10.1, 8.10.7}
 category:           Language
 homepage:           https://github.com/ucsd-progsys/liquid-fixpoint
 build-type:         Simple
@@ -35,11 +35,6 @@ extra-source-files: tests/neg/*.fq
 source-repository head
   type:     git
   location: https://github.com/ucsd-progsys/liquid-fixpoint/
-
-flag devel
-  default:     False
-  manual:      True
-  description: turn on stricter error reporting for development
 
 library
   autogen-modules:  Paths_liquid_fixpoint
@@ -146,10 +141,7 @@ library
                   , aeson
                   , rest-rewrite >= 0.1.1
   default-language: Haskell98
-  ghc-options:      -W -fno-warn-missing-methods -fwarn-missing-signatures
-
-  if flag(devel)
-    ghc-options: -Werror
+  ghc-options:      -W -fno-warn-missing-methods -fwarn-missing-signatures -Werror
 
   if !os(windows)
     hs-source-dirs: unix
@@ -163,10 +155,7 @@ executable fixpoint
   hs-source-dirs:   bin
   build-depends:    base >= 4.9.1.0 && < 5, liquid-fixpoint
   default-language: Haskell98
-  ghc-options:      -threaded -W -fno-warn-missing-methods
-
-  if flag(devel)
-    ghc-options: -Werror
+  ghc-options:      -threaded -W -fno-warn-missing-methods -Werror
 
 test-suite test
   type:             exitcode-stdio-1.0
@@ -190,10 +179,7 @@ test-suite test
                   , tasty-rerun   >= 1.1.12
                   , transformers  >= 0.5
   default-language: Haskell98
-  ghc-options:      -threaded
-
-  if flag(devel)
-    ghc-options: -Werror
+  ghc-options:      -threaded -Werror
 
 test-suite tasty
   type:             exitcode-stdio-1.0
@@ -218,7 +204,4 @@ test-suite tasty
                   , text
                   , unordered-containers
   default-language: Haskell98
-  ghc-options:      -threaded
-
-  if flag(devel)
-    ghc-options: -Werror
+  ghc-options:      -threaded -Werror
