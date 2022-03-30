@@ -12,6 +12,7 @@ jobs:
     name: Build & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-20.04, macos-11]
     steps:
@@ -36,5 +37,7 @@ jobs:
         run: nix develop --command -- cabal update
       - name: Build
         run: nix develop --command -- cabal build --enable-tests
-      - name: Test
-        run: nix develop --command -- cabal test --test-show-details=direct
+      - name: Test (test)
+        run: nix develop --command -- cabal test test --test-show-details=direct
+      - name: Test (tasty)
+        run: nix develop --command -- cabal test tasty --test-show-details=direct
