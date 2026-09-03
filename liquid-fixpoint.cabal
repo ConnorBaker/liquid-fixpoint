@@ -236,6 +236,7 @@ test-suite tasty
                     SimplifyKVarTests
                     SimplifyPLE
                     SimplifyTests
+                    SortCheckTests
                     UndoANFTests
                     Paths_liquid_fixpoint
   if impl(ghc>=9.12.1)

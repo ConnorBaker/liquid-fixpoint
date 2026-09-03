@@ -1378,10 +1378,31 @@ checkRelTy _ e _  t1 t2      = unless (t1 == t2) (throwErrorAt $ errRel e t1 t2)
 -- that case isn't considered in this function.
 --
 checkURel :: Expr -> Sort -> Sort -> CheckM ()
-checkURel e s1 s2 = unless (b1 == b2) (throwErrorAt $ errRel e s1 s2)
+checkURel e s1 s2 = unless (b1 == b2 && a1 == a2) (throwErrorAt $ errRel e s1 s2)
   where
     b1            = s1 == boolSort
     b2            = s2 == boolSort
+    a1            = smtAggregateHead s1
+    a2            = smtAggregateHead s2
+
+-- | The head type constructor of a sort that 'fappSmtSort' represents with an
+-- aggregate SMTLIB sort rather than @Int@, and 'Nothing' for every other sort.
+-- The arities match 'fappSmtSort' exactly, so a partially applied @Array_t@ is
+-- 'Nothing', as it is there.
+--
+-- @Map_t@ is absent because 'fappSmtSort' has no branch for it, so a map is
+-- @Int@-represented; where 'coerceMapToArray' has rewritten one to @Array_t@ it
+-- is covered by that entry. Strings, bit vectors, @FFld_t@ and user datatypes
+-- also get non-@Int@ sorts and are NOT covered -- no failure has been observed
+-- for the first three, and the last would need the @SEnv DataDecl@ that
+-- 'CheckM' does not carry.
+--
+-- Only the head is compared, so @Set a ~~ Set b@ is still admitted.
+smtAggregateHead :: Sort -> Maybe Symbol
+smtAggregateHead t = case unFApp (unAbs t) of
+  [FTC c, _]    | symbol c `elem` [setConName, bagConName] -> Just (symbol c)
+  [FTC c, _, _] | symbol c == arrayConName                 -> Just (symbol c)
+  _                                                        -> Nothing
 
 
 --------------------------------------------------------------------------------

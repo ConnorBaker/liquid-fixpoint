@@ -4,6 +4,7 @@ module Main where
 
 import qualified ParserTests
 import qualified ShareMapTests
+import qualified SortCheckTests
 import qualified SimplifyTests
 import qualified SimplifyKVarTests
 import qualified InterpretTests
@@ -14,6 +15,7 @@ main :: IO ()
 main = defaultMain $ testGroup "Tests"
   [ ParserTests.tests
   , ShareMapTests.tests
+  , SortCheckTests.tests
   , SimplifyTests.tests
   , SimplifyKVarTests.tests
   , InterpretTests.tests

@@ -2,6 +2,10 @@
 
 ## NEXT
 
+- Reject `~~` and `!~` between an aggregate sort (`Set`, `Bag`, `Array`) and a
+  sort SMTLIB represents differently, which previously produced a query the
+  solver rejected wholesale, naming no binder
+
 ## 0.9.6.3.7 (2026-06-04)
 
 - Migrate from cmdargs to base:System.Console.GetOpt
