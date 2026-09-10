@@ -115,7 +115,8 @@ applyConstantFolding bop' e1 e2 =
       where
         go f = ECon $ I $ f left right
 
-        getOp' Mod | right /= 0 = Just mod
+        -- SMT-LIB mod is Euclidean even when the divisor is negative.
+        getOp' Mod | right /= 0 = Just (\x y -> x `mod` abs y)
         getOp' op  = getOp op
 
 isSetPred :: Expr -> Bool
@@ -162,4 +163,3 @@ applySetFolding expr1 expr2   = case expr1 of
       (EApp (EVar f) e1')  -> getOp f <*> evalSetI e1' <*> evalSetI e2
       _                    -> Nothing
     evalSetI _            = Nothing
-
