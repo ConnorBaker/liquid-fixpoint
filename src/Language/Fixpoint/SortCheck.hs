@@ -422,7 +422,10 @@ elabSorts ef (EBin b e1 e2)    = EBin b (elabSorts ef e1) (elabSorts ef e2)
 elabSorts ef (ELet x e1 e2)    = ELet x (elabSorts ef e1) (elabSorts ef e2)
 elabSorts ef (EIte e1 e2 e3)   = EIte (elabSorts ef e1) (elabSorts ef e2) (elabSorts ef e3)
 elabSorts ef (ECst e s)        = ECst (elabSorts ef e) (coerceSort ef s)
-elabSorts ef (ELam b e)        = ELam b (elabSorts ef e)
+-- Normalize binders before checking their bodies, just as casts and the outer
+-- environment are normalized. Otherwise a Set-bound variable is checked
+-- against an Array cast after the set theory has been encoded as arrays.
+elabSorts ef (ELam b e)        = ELam (second (coerceSort ef) b) (elabSorts ef e)
 elabSorts ef (ETApp e s)       = ETApp (elabSorts ef e) (coerceSort ef s)
 elabSorts ef (ETAbs e t)       = ETAbs (elabSorts ef e) t
 elabSorts ef (PAnd es)         = PAnd (elabSorts ef <$> es)
@@ -431,8 +434,8 @@ elabSorts ef (PNot e)          = PNot (elabSorts ef e)
 elabSorts ef (PImp e1 e2)      = PImp (elabSorts ef e1) (elabSorts ef e2)
 elabSorts ef (PIff e1 e2)      = PIff (elabSorts ef e1) (elabSorts ef e2)
 elabSorts ef (PAtom r e1 e2)   = PAtom r (elabSorts ef e1) (elabSorts ef e2)
-elabSorts ef (PAll   bs e)     = PAll bs (elabSorts ef e)
-elabSorts ef (PExist bs e)     = PExist bs (elabSorts ef e)
+elabSorts ef (PAll   bs e)     = PAll (map (second (coerceSort ef)) bs) (elabSorts ef e)
+elabSorts ef (PExist bs e)     = PExist (map (second (coerceSort ef)) bs) (elabSorts ef e)
 elabSorts ef (ECoerc s1 s2 e)  = ECoerc (coerceSort ef s1) (coerceSort ef s2) (elabSorts ef e)
 elabSorts ef (PKVar k tsu su)      = PKVar k tsu (mapKVarSubst (elabSorts ef) su)
 elabSorts _ e                 = e

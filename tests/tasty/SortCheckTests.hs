@@ -9,9 +9,12 @@
 -- test could not tell the two apart.
 module SortCheckTests (tests) where
 
+import           Control.Exception           (evaluate, try)
+import           Data.List                   (isInfixOf)
 import           Data.Maybe                  (isJust)
-import           Language.Fixpoint.SortCheck (checkSortExpr)
+import           Language.Fixpoint.SortCheck (ElabParam (..), Elaborate (..), checkSortExpr)
 import           Language.Fixpoint.Types
+import           Language.Fixpoint.Types.Config (ElabFlags (..))
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
@@ -85,4 +88,64 @@ tests = testGroup "checkURel"
 
   , testGroup "REJECTED already: bool against non-bool, unchanged by this patch"
       [ testCase "int ~~ bool" (accepts intSort Ueq boolSort @?= False) ]
+  , binderTests
   ]
+
+-- The public elaboration boundary must normalize bound-variable annotations
+-- and body casts together. Checking only the final binder would miss the bug:
+-- elab already normalizes that binder, but used to check its body first under
+-- the unnormalized sort. Equality forces the cast to be checked in that body.
+binderTests :: TestTree
+binderTests = testGroup "binder theory-sort normalization"
+  [ testGroup "accepted with matching body casts"
+      [ testCase (binderName ++ "/" ++ sortName ++ "/arrays=" ++ show arrays) $ do
+          let ef = ElabFlags arrays False
+              body = PAtom Eq (ECst (EVar "x") s) (EVar "x")
+              result = elaborate (ElabParam ef "binder regression" mempty) (bind s body)
+              expected = resultSort (coerceSort ef s)
+          _ <- evaluate (length (show result))
+          checkSortExpr dummySpan emptySEnv result @?= Just expected
+      | (binderName, bind, resultSort) <- binders
+      , (sortName, s) <- sorts
+      , arrays <- [False, True]
+      ]
+  , testGroup "rejected genuine cast mismatches"
+      [ testCase (binderName ++ "/" ++ castName ++ "/arrays=" ++ show arrays) $ do
+          let body = PAtom Eq (ECst (EVar "x") target) (EVar "x")
+              result = elaborate (ElabParam (ElabFlags arrays False) "bad binder cast" mempty)
+                         (bind source body)
+          outcome <- try (evaluate (length (show result))) :: IO (Either Error Int)
+          case outcome of
+            Left err -> do
+              let diagnostic = show err
+              assertBool diagnostic ("Cannot cast" `isInfixOf` diagnostic)
+              assertBool diagnostic ("incompatible sort" `isInfixOf` diagnostic)
+            Right _ -> assertFailure "elaboration admitted an incompatible array cast"
+      | (binderName, bind, _) <- binders
+      , (castName, source, target) <- badCasts
+      , arrays <- [False, True]
+      ]
+  ]
+  where
+    binders :: [(String, Sort -> Expr -> Expr, Sort -> Sort)]
+    binders =
+      [ ("lambda", \s -> ELam ("x", s), \s -> FFunc s boolSort)
+      , ("forall", \s -> PAll [("x", s)], const boolSort)
+      , ("exists", \s -> PExist [("x", s)], const boolSort)
+      ]
+    sorts :: [(String, Sort)]
+    sorts =
+      [ ("set", set)
+      , ("bag", bag)
+      , ("map", mapt)
+      , ("array", array)
+      , ("nested-set", setSort (setSort intSort))
+      , ("nested-map", aggregate mapConName [set, bag])
+      , ("nested-array", arraySort set bag)
+      ]
+    badCasts :: [(String, Sort, Sort)]
+    badCasts =
+      [ ("wrong-array-range", array, arraySort intSort intSort)
+      , ("wrong-array-element", array, arraySort boolSort boolSort)
+      , ("array-to-int", array, intSort)
+      ]
