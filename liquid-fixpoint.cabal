@@ -233,6 +233,7 @@ test-suite tasty
                     InterpretTests
                     ParserTests
                     PolyValueTests
+                    QuantifiedFamilyTests
                     ShareMapReference
                     ShareMapTests
                     SimplifyInterpreter

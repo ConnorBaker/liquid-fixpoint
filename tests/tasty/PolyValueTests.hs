@@ -204,7 +204,7 @@ tests =
         , testCase "polymorphic quantifier rejects explicitly" $
             rejects
                 "quantified polymorphic value families"
-                (PAll [("local", scheme)] PTrue :: Expr)
+                (PAll [("local", scheme)] (PAtom Eq (value "local" integers) (value "local" integers)) :: Expr)
         , testCase "polymorphic lambda binder rejects explicitly" $
             rejects
                 "quantified polymorphic value families"

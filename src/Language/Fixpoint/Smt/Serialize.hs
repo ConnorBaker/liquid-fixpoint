@@ -26,6 +26,7 @@ import qualified Language.Fixpoint.Smt.Theories as Thy
 import           Language.Fixpoint.Misc (sortNub, errorstar)
 import           Language.Fixpoint.Utils.Builder as Builder
 import qualified Data.Text as T
+import qualified Data.HashSet as HS
 import Data.Text (Text)
 -- import Debug.Trace (trace)
 
@@ -249,10 +250,24 @@ withSmtShadowing names action = do
   pure result
 
 smt2Quantifier :: Builder -> [(Symbol, Sort)] -> Expr -> SymM Builder
-smt2Quantifier quantifier binders body = withSmtBinders binders $ do
-  names <- smt2s binders
-  predicate <- smt2 body
-  pure $ parenSeqs [quantifier, parens names, predicate]
+smt2Quantifier quantifier originalBinders body
+  | null binders = smt2 body
+  | otherwise = withSmtBinders binders $ do
+      names <- smt2s binders
+      predicate <- smt2 body
+      pure $ parenSeqs [quantifier, parens names, predicate]
+  where
+    binders = retainQuantifiedBinders [body] originalBinders
+
+-- Vacuous quantification does not change a predicate over LF's nonempty
+-- logical domains. Apply that law only to otherwise unsupported family
+-- binders; used families still require a separate quantified-family model.
+-- Patterns count as uses and are interpreted in the same lexical scope.
+retainQuantifiedBinders :: [Expr] -> [(Symbol, Sort)] -> [(Symbol, Sort)]
+retainQuantifiedBinders expressions = filter retained
+  where
+    free = HS.unions (map exprSymbolsSet expressions)
+    retained (name, sort) = not (isPolyValueSort sort) || HS.member name free
 
 -- | smt2Cast uses the 'as x T' pattern needed for polymorphic ADT constructors
 --   like Nil, see `tests/pos/adt_list_1.fq`
@@ -431,11 +446,16 @@ instance SMTLIB2 (Triggered Expr) where
 
 {-# INLINE smtTr #-}
 smtTr :: Builder -> [(Symbol, Sort)] -> Expr -> Triggered Expr -> SymM Builder
-smtTr q xs p t =
-  do s <- smt2s xs
+smtTr q originalBinders p t
+  | null binders = smt2 p
+  | otherwise = withSmtBinders binders $ do
+     s <- smt2s binders
      s1 <- smt2 p
-     s2 <- smt2s (makeTriggers t)
+     s2 <- smt2s patterns
      pure $ key q (parens s <+> key "!" (s1 <+> ":pattern" <> parens s2))
+  where
+    patterns = makeTriggers t
+    binders = retainQuantifiedBinders (p : patterns) originalBinders
 
 {-# INLINE smt2s #-}
 smt2s :: SMTLIB2 a => [a] -> SymM Builder
