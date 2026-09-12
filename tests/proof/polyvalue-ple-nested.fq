@@ -1,0 +1,16 @@
+fixpoint "--rewrite"
+data Token 0 = [ | First {} | Second {} ]
+constant empty : func(1, [Set_Set @(0)])
+constant end : func(1, [List @(0)])
+constant keep : func(1, [Set_Set @(0); List @(0); Set_Set @(0)])
+constant wrap : func(0, [Token; Set_Set Token])
+define keep (xs : Set_Set @(-1), ys : List @(-1)) : Set_Set @(-1) = {xs}
+define wrap (x : Token) : Set_Set Token = {keep empty end}
+bind 0 witness : {v : Set_Set Token | v = empty}
+bind 1 token : {v : Token | []}
+constraint:
+  env [0; 1]
+  lhs {v : Set_Set Token | v = wrap token}
+  rhs {v : Set_Set Token | v = witness}
+  id 0 tag []
+expand [0 : True]

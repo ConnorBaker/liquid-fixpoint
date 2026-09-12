@@ -1,0 +1,11 @@
+// Function values and Int values share an SMT representation, not a meaning.
+constant firstFamily : func(1, [@(0)])
+constant secondFamily : func(1, [@(0)])
+constant observeFunction : func(0, [func(0, [int; int]); int])
+bind 0 coincidence : {v : int | v = firstFamily && v = secondFamily}
+
+constraint:
+  env [0]
+  lhs {v : int | v = observeFunction firstFamily}
+  rhs {v : int | v = observeFunction secondFamily}
+  id 0 tag []

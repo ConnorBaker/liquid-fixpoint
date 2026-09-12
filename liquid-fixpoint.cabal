@@ -28,6 +28,8 @@ build-type:         Simple
 tested-with:        GHC == 9.14.1, GHC == 9.12.2, GHC == 9.10.1, GHC == 9.8.2
 extra-source-files: tests/neg/*.fq
                     tests/pos/*.fq
+                    tests/crash/*.fq
+                    tests/proof/*.fq
                     unix/Language/Fixpoint/Utils/*.hs
                     win/Language/Fixpoint/Utils/*.hs
                     tests/logs/cur/pin
@@ -230,6 +232,7 @@ test-suite tasty
   other-modules:    Arbitrary
                     InterpretTests
                     ParserTests
+                    PolyValueTests
                     ShareMapReference
                     ShareMapTests
                     SimplifyInterpreter
@@ -247,9 +250,14 @@ test-suite tasty
   hs-source-dirs:   tests/tasty
   ghc-options:      -threaded
   build-depends:    base            >= 4.9.1.0 && < 5
+                  , bytestring
                   , containers
+                  , deepseq
                   , hashable
                   , liquid-fixpoint
+                  , mtl
+                  , process
+                  , store
                   , tasty           >= 0.10
                   , tasty-hunit     >= 0.9
                   , tasty-quickcheck
@@ -257,4 +265,5 @@ test-suite tasty
                   , unordered-containers
   if flag(devel)
     ghc-options: -Werror
+  build-tool-depends: liquid-fixpoint:fixpoint
   default-language: Haskell98

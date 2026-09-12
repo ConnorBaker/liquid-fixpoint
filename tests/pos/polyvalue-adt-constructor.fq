@@ -1,0 +1,17 @@
+// True polymorphic datatype constructors still require SMT's as syntax.
+data Token 0 = [ | First {} | Second {} ]
+data List 1 = [ | Nil {} | Cons { hd : @(0), tl : List @(0) } ]
+constant family : func(1, [Set_Set @(0)])
+bind 0 tokens : {v : Set_Set Token | v = family}
+
+constraint:
+  env [0]
+  lhs {v : List Token | v = Nil}
+  rhs {v : List Token | ~ (is$Cons v)}
+  id 0 tag []
+
+constraint:
+  env [0]
+  lhs {v : List int | v = Nil}
+  rhs {v : List int | ~ (is$Cons v)}
+  id 1 tag []

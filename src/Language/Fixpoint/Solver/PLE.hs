@@ -726,48 +726,53 @@ data EvalType =
 -- discovered as necessary.
 eval :: Knowledge -> ICtx -> EvalType -> Expr -> EvalST Expr
 eval γ ctx et = go
-  where
-    go (ELam (x,s) e)   = evalELam γ ctx et (x, s) e
-    go e@EIte{}         = evalIte γ ctx et e
-    go (ECoerc s t e)   = ECoerc s t <$> go e
-    go e@(EApp _ _)     =
-      case splitEAppThroughECst e of
-       (f, es) | et == RWNormal ->
-          -- Just evaluate the arguments first, to give rewriting a chance to step in
-          -- if necessary
-          do
-            es' <- mapM (eval γ ctx et) es
-            if es /= es'
-              then return (eApps f es')
-              else do
-                f' <- case dropECst f of
-                  EVar _ -> pure f
-                  _      -> go f
-                Mb.fromMaybe (eApps f' es') <$> evalApp γ ctx f' es et
-       (f, es) ->
-          do
-            f' <- case dropECst f of
-              EVar _ -> pure f
-              _      -> go f
-            es' <- mapM (eval γ ctx et) es
-            Mb.fromMaybe (eApps f' es') <$> evalApp γ ctx f' es' et
+ where
+  go (ELam (x, s) e) = evalELam γ ctx et (x, s) e
+  go e@EIte{} = evalIte γ ctx et e
+  go (ECoerc s t e) = ECoerc s t <$> go e
+  go (ECst e t)
+    | EApp{} <- dropECst e =
+        (`ECst` t) <$> goApp (Just t) e
+  go e@(EApp _ _) = goApp Nothing e
+  go (PAtom r e1 e2) = PAtom r <$> go e1 <*> go e2
+  go (ENeg e) = ENeg <$> go e
+  go (EBin o e1 e2) = EBin o <$> go e1 <*> go e2
+  go (ETApp e t) = (`ETApp` t) <$> go e
+  go (ETAbs e s) = (`ETAbs` s) <$> go e
+  go (PNot e') = PNot <$> go e'
+  go (PImp e1 e2) = PImp <$> go e1 <*> go e2
+  go (PIff e1 e2) = PIff <$> go e1 <*> go e2
+  go (PAnd es) = PAnd <$> traverse go es
+  go (POr es) = POr <$> traverse go es
+  go e | EVar _ <- dropECst e = do
+    Mb.fromMaybe e <$> evalApp γ ctx e [] et Nothing
+  go (ECst e t) = (`ECst` t) <$> go e
+  go (ELet x e1 e2) = ELet x <$> go e1 <*> go e2
+  go e = return e
 
-    go (PAtom r e1 e2) = PAtom r <$> go e1 <*> go e2
-    go (ENeg e)         = ENeg <$> go e
-    go (EBin o e1 e2)   = EBin o <$> go e1 <*> go e2
-    go (ETApp e t)      = (`ETApp` t) <$> go e
-    go (ETAbs e s)      = (`ETAbs` s) <$> go e
-    go (PNot e')        = PNot <$> go e'
-    go (PImp e1 e2)     = PImp <$> go e1 <*> go e2
-    go (PIff e1 e2)     = PIff <$> go e1 <*> go e2
-    go (PAnd es)        = PAnd <$> traverse go es
-    go (POr es)         = POr <$> traverse go es
-    go e | EVar _ <- dropECst e = do
-      Mb.fromMaybe e <$> evalApp γ ctx e [] et
-    go (ECst e t)       = (`ECst` t) <$> go e
-    go (ELet x e1 e2)   = ELet x <$> go e1 <*> go e2
-
-    go e                = return e
+  -- Preserve the caller's result before splitting the application: an
+  -- argument-only instantiation cannot recover result-only parameters.
+  goApp expected e =
+    case splitEAppThroughECst e of
+      (f, es) | et == RWNormal ->
+        -- Just evaluate the arguments first, to give rewriting a chance to step in
+        -- if necessary
+        do
+          es' <- mapM (eval γ ctx et) es
+          if es /= es'
+            then return (eApps f es')
+            else do
+              f' <- case dropECst f of
+                EVar _ -> pure f
+                _ -> go f
+              Mb.fromMaybe (eApps f' es') <$> evalApp γ ctx f' es et expected
+      (f, es) ->
+        do
+          f' <- case dropECst f of
+            EVar _ -> pure f
+            _ -> go f
+          es' <- mapM (eval γ ctx et) es
+          Mb.fromMaybe (eApps f' es') <$> evalApp γ ctx f' es' et expected
 
 
 -- | 'evalELam' produces equations that preserve the context of a rewrite
@@ -1068,129 +1073,111 @@ evalRESTWithCache cacheRef γ ctx acc rp =
 
 -- | @evalApp kn ctx e es@ unfolds expressions in @eApps e es@ using rewrites
 -- and equations
-evalApp :: Knowledge -> ICtx -> Expr -> [Expr] -> EvalType -> EvalST (Maybe Expr)
-evalApp γ ctx e0 es et
+evalApp :: Knowledge -> ICtx -> Expr -> [Expr] -> EvalType -> Maybe Sort -> EvalST (Maybe Expr)
+evalApp γ ctx e0 es et expected
   | EVar f <- dropECst e0
   , Just eq <- Map.lookup f (knAms γ)
-  , length (eqArgs eq) <= length es
-  = do
-       env <- gets (seSort . evEnv)
-       okFuel <- checkFuel f
-       if okFuel && et /= FuncNormal then do
-         let (es1, es2) = splitAt (length (eqArgs eq)) es
-         -- See Note [Elaboration for eta expansion].
-         let newE = substEq env eq es1
-         newE' <- if icEtaBetaFlag ctx
-                    then elaborateExpr "EvalApp unfold full: " newE
-                    else pure newE
-
-         e' <- evalIte γ ctx et newE'        -- TODO:FUEL this is where an "unfolding" happens, CHECK/BUMP counter
-         let e2' = stripPLEUnfold e'
-         let e3' = simplify γ ctx (eApps e2' es2)  -- reduces a bit the equations
-
-         if hasUndecidedGuard e' && guardOf e' == guardOf newE' && et /= NoRWEta then do
-           -- Don't unfold the expression if there is an if-then-else guarding
-           -- it, just to preserve the size of further rewrites.
-           -- If evalIte does any modifications, though, we do unfold in order
-           -- to allow analysis of the resulting expression
-           -- Note(Alessio): this optimization make sense only if the
-           -- function is already fully applied in the original
-           -- program and not because of eta expansion, otherwise we might
-           -- miss redexes. See https://github.com/ucsd-progsys/liquidhaskell/issues/2652
-           modify $ \st -> st
-             { evPendingUnfoldings =
-                 M.insertWith M.union (evExScope st) (M.singleton (eApps e0 es) e3') (evPendingUnfoldings st)
-             }
-           return Nothing
-         else do
-           useFuel f
-           modify $ \st -> st
-             { evNewEqualities = S.insert (eApps e0 es, e3') (evNewEqualities st)
-             , evPendingUnfoldings = M.adjust (M.delete (eApps e0 es)) (evExScope st) (evPendingUnfoldings st)
-             }
-           return (Just $ eApps e2' es2)
-       else return Nothing
-  where
-    -- At the time of writing, any function application wrapping an
-    -- if-statement would have the effect of unfolding the invocation.
-    -- However, using pleUnfold still has the advantage of not generating
-    -- extra equations to unfold pleUnfold itself. Using pleUnfold also
-    -- makes the intention of the user rather explicit.
-    stripPLEUnfold e
-      | (ef, [arg]) <- splitEAppThroughECst e
-      , EVar f <- dropECst ef
-      , f == "Language.Haskell.Liquid.ProofCombinators.pleUnfold"
-      = arg
-      | otherwise = e
-
-    hasUndecidedGuard EIte{} = True
-    hasUndecidedGuard _ = False
-
-    guardOf (EIte g _ _) = Just g
-    guardOf _ = Nothing
-
-evalApp γ ctx e0 args@(e:es) _
+  , length (eqArgs eq) <= length es =
+      do
+        state <- get
+        let env = seSort (insertsSymEnv (evEnv state) (evExScope state))
+        okFuel <- checkFuel f
+        if okFuel && et /= FuncNormal
+          then do
+            let (es1, es2) = splitAt (length (eqArgs eq)) es
+            let newE = substEq env eq es1
+                callSort = Mb.fromMaybe (sortExpr (panicSpan "unfold call") env (eApps e0 es)) expected
+                prefixSort = foldr FFunc callSort (map (sortExpr (panicSpan "unfold extra argument") env) es2)
+            prepared <- prepareUnfolding γ ctx et prefixSort newE
+            case prepared of
+              Left deferred -> do
+                rememberPending (eApps e0 es) (eApps deferred es2)
+                return Nothing
+              Right e' -> do
+                let e2' = stripPLEUnfold e'
+                    e3' = simplify γ ctx (eApps e2' es2)
+                useFuel f
+                modify $ \st ->
+                  st
+                    { evNewEqualities = S.insert (eApps e0 es, e3') (evNewEqualities st)
+                    , evPendingUnfoldings = M.adjust (M.delete (eApps e0 es)) (evExScope st) (evPendingUnfoldings st)
+                    }
+                return (Just $ eApps e2' es2)
+          else return Nothing
+ where
+  -- At the time of writing, any function application wrapping an
+  -- if-statement would have the effect of unfolding the invocation.
+  -- However, using pleUnfold still has the advantage of not generating
+  -- extra equations to unfold pleUnfold itself. Using pleUnfold also
+  -- makes the intention of the user rather explicit.
+  stripPLEUnfold e
+    | (ef, [arg]) <- splitEAppThroughECst e
+    , EVar f <- dropECst ef
+    , f == "Language.Haskell.Liquid.ProofCombinators.pleUnfold" =
+        arg
+    | otherwise = e
+evalApp γ ctx e0 args@(e : es) et expected
   | EVar f <- dropECst e0
   , (d, as) <- splitEAppThroughECst e
   , EVar dc <- dropECst d
   , Just rws <- Map.lookup dc (knSims γ)
-    -- User data measures aren't sent to the SMT solver because
+  , -- User data measures aren't sent to the SMT solver because
     -- it knows already about selectors and constructor tests.
-  , Just (rw, isUserDataSMeasure) <- L.find (\(rw, _) -> smName rw == f) rws
-  , length as == length (smArgs rw)
-  = do
-    let newE = eApps (subst (mkSubst $ zip (smArgs rw) as) (smBody rw)) es
-    when (isUserDataSMeasure == NoUserDataSMeasure) $
-      modify $ \st -> st
-        { evNewEqualities = S.insert (eApps e0 args, simplify γ ctx newE) (evNewEqualities st) }
-    return (Just newE)
-
-evalApp γ ctx e0 es _et
-  | eqs@(_:_) <- noUserDataMeasureEqs γ (eApps e0 es)
-  = do
-       env <- gets (seSort . evEnv)
-       -- Only well-sorted LHSs should be considered. For instance, a measure
-       -- expecting an argument of type [[Int]] should not be applied to a value
-       -- of type [Int].
-       let eqs' = map (second $ simplify γ ctx) $
-                    filter (wellSorted env . fst) eqs
-       if null eqs' then return Nothing
-       else do
-         modify $ \st ->
-           st { evNewEqualities = foldr S.insert (evNewEqualities st) eqs' }
-         return Nothing
-
-evalApp γ ctx e0 es et
+    Just (rw, isUserDataSMeasure) <- L.find (\(rw, _) -> smName rw == f) rws
+  , length as == length (smArgs rw) =
+      do
+        let newE = eApps (subst (mkSubst $ zip (smArgs rw) as) (smBody rw)) es
+        typed <- elaborateUnfolding γ ctx et expected (eApps e0 args) newE
+        forM_ typed $ \body ->
+          when (isUserDataSMeasure == NoUserDataSMeasure) $
+            modify $ \st ->
+              st{evNewEqualities = S.insert (eApps e0 args, simplify γ ctx body) (evNewEqualities st)}
+        return typed
+evalApp γ ctx e0 es et expected
+  | eqs@(_ : _) <- noUserDataMeasureEqs γ (maybe id (flip ECst) expected (eApps e0 es)) =
+      do
+        state <- get
+        let env = seSort (insertsSymEnv (evEnv state) (evExScope state))
+        -- Only well-sorted LHSs should be considered. For instance, a measure
+        -- expecting an argument of type [[Int]] should not be applied to a value
+        -- of type [Int].
+        let sortedEqs = filter (wellSorted env . fst) eqs
+        typedEqs <- mapM (\(lhs, rhs) -> fmap (lhs,) <$> elaborateUnfolding γ ctx et Nothing lhs rhs) sortedEqs
+        let eqs' = map (second $ simplify γ ctx) (Mb.catMaybes typedEqs)
+        if null eqs'
+          then return Nothing
+          else do
+            modify $ \st ->
+              st{evNewEqualities = foldr S.insert (evNewEqualities st) eqs'}
+            return Nothing
+evalApp γ ctx e0 es et _
   | ELam (argName, _) body <- dropECst e0
-  , lambdaArg:remArgs <- es
-  , icEtaBetaFlag ctx || icExtensionalityFlag ctx
-  = do
-      isFuelOk <- checkFuel argName
-      if isFuelOk
-        then do
-          useFuel argName
-          let argSubst = mkSubst [(argName, lambdaArg)]
-          let body' = subst argSubst body
-          body'' <- evalIte γ ctx et body'
-          let simpBody = simplify γ ctx (eApps body'' remArgs)
-          modify $ \st ->
-            st { evNewEqualities = S.insert (eApps e0 es, simpBody) (evNewEqualities st) }
-          return (Just $ eApps body'' remArgs)
-        else do
-          return Nothing
-
-evalApp _ ctx e0 es _
+  , lambdaArg : remArgs <- es
+  , icEtaBetaFlag ctx || icExtensionalityFlag ctx =
+      do
+        isFuelOk <- checkFuel argName
+        if isFuelOk
+          then do
+            useFuel argName
+            let argSubst = mkSubst [(argName, lambdaArg)]
+            let body' = subst argSubst body
+            body'' <- evalIte γ ctx et body'
+            let simpBody = simplify γ ctx (eApps body'' remArgs)
+            modify $ \st ->
+              st{evNewEqualities = S.insert (eApps e0 es, simpBody) (evNewEqualities st)}
+            return (Just $ eApps body'' remArgs)
+          else do
+            return Nothing
+evalApp γ ctx e0 es et expected
   | icLocalRewritesFlag ctx
   , EVar f <- dropECst e0
-  , Just rw <- lookupRewrite f $ icLRWs ctx
-  = do
-      -- expandedTerm <- elaborateExpr "EvalApp rewrite local:" $ eApps rw es
-      let expandedTerm = eApps rw es
-      modify $ \st -> st
-        { evNewEqualities = S.insert (eApps e0 es, expandedTerm) (evNewEqualities st) }
-      return (Just expandedTerm)
-
-evalApp γ ctx e0 es _et
+  , Just rw <- lookupRewrite f $ icLRWs ctx =
+      do
+        expandedTerm <- elaborateUnfolding γ ctx et expected (eApps e0 es) (eApps rw es)
+        forM_ expandedTerm $ \body ->
+          modify $ \st -> st{evNewEqualities = S.insert (eApps e0 es, body) (evNewEqualities st)}
+        return expandedTerm
+evalApp γ ctx e0 es _et _
   -- We check the annotation instead of the equations in γ for two reasons.
   --
   -- First, we want to eta expand functions that might not be reflected. Suppose
@@ -1210,38 +1197,41 @@ evalApp γ ctx e0 es _et
   , let expectedArgs = unpackFFuncs sortAnnotation
   , let nProvidedArgs = length es
   , let nArgsMissing = length expectedArgs - nProvidedArgs
-  , nArgsMissing > 0
-  = do
-    let etaArgsType = drop nProvidedArgs expectedArgs
-    -- Fresh names for the eta expansion
-    etaNames <- makeFreshEtaNames nArgsMissing
+  , nArgsMissing > 0 =
+      do
+        let etaArgsType = drop nProvidedArgs expectedArgs
+        -- Fresh names for the eta expansion
+        etaNames <- makeFreshEtaNames nArgsMissing
 
-    let etaVars = zipWith (\name ty -> ECst (EVar name) ty) etaNames etaArgsType
-    let fullBody = eApps e0 (es ++ etaVars)
-    let etaExpandedTerm = mkLams fullBody (zip etaNames etaArgsType)
+        let etaVars = zipWith (\name ty -> ECst (EVar name) ty) etaNames etaArgsType
+        let fullBody = eApps e0 (es ++ etaVars)
+        let etaExpandedTerm = mkLams fullBody (zip etaNames etaArgsType)
 
-    -- Note: we should always add the equality as etaNames is always non empty because the
-    -- only way for etaNames to be empty is if the function is fully applied, but that case
-    -- is already handled by the previous case of evalApp
-    modify $ \st -> st
-      { evNewEqualities = S.insert (eApps e0 es, etaExpandedTerm) (evNewEqualities st) }
+        -- Note: we should always add the equality as etaNames is always non empty because the
+        -- only way for etaNames to be empty is if the function is fully applied, but that case
+        -- is already handled by the previous case of evalApp
+        modify $ \st ->
+          st
+            { evNewEqualities = S.insert (eApps e0 es, etaExpandedTerm) (evNewEqualities st)
+            }
 
-    -- We also try to unfold the definition of the function in the eta
-    -- expanded body, as it might give us more information to generate
-    -- better equalities. Note that we pass NoRWEta to skip the optimization
-    redBody <- evalInExtendedEnv (zip etaNames etaArgsType) γ ctx NoRWEta fullBody
-    let etaExpandedRedBody = mkLams redBody (zip etaNames etaArgsType)
-    modify $ \st -> st
-      { evNewEqualities = S.insert (eApps e0 es, etaExpandedRedBody) (evNewEqualities st) }
+        -- We also try to unfold the definition of the function in the eta
+        -- expanded body, as it might give us more information to generate
+        -- better equalities. Note that we pass NoRWEta to skip the optimization
+        redBody <- evalInExtendedEnv (zip etaNames etaArgsType) γ ctx NoRWEta fullBody
+        let etaExpandedRedBody = mkLams redBody (zip etaNames etaArgsType)
+        modify $ \st ->
+          st
+            { evNewEqualities = S.insert (eApps e0 es, etaExpandedRedBody) (evNewEqualities st)
+            }
 
-    return (Just etaExpandedTerm)
-  where
-    unpackFFuncs (FFunc t ts) = t : unpackFFuncs ts
-    unpackFFuncs _ = []
+        return (Just etaExpandedTerm)
+ where
+  unpackFFuncs (FFunc t ts) = t : unpackFFuncs ts
+  unpackFFuncs _ = []
 
-    mkLams subject binds = foldr ELam subject binds
-
-evalApp _ _ctx _e0 _es _ = do
+  mkLams subject binds = foldr ELam subject binds
+evalApp _ _ctx _e0 _es _ _ = do
   return Nothing
 
 -- | Evaluates if-then-else statements until they can't be evaluated anymore
@@ -1606,13 +1596,75 @@ makeFreshEtaNames n = replicateM n makeFreshName
       modify $ \st -> st { freshEtaNames = 1 + freshEtaNames st }
       pure $ etaExpSymbol ident
 
-elaborateExpr :: String -> Expr -> EvalST Expr
-elaborateExpr msg e = do
+-- Type an emitted unfolding in its caller's scope before further evaluation.
+elaborateUnfolding :: Knowledge -> ICtx -> EvalType -> Maybe Sort -> Expr -> Expr -> EvalST (Maybe Expr)
+elaborateUnfolding γ ctx et expected original body = do
+  state <- get
+  let env = seSort (insertsSymEnv (evEnv state) (evExScope state))
+      result = Mb.fromMaybe (sortExpr (panicSpan "unfold result") env original) expected
+  prepared <- prepareUnfolding γ ctx et result body
+  case prepared of
+    Left deferred -> rememberPending original deferred >> return Nothing
+    Right typed -> do
+      modify $ \st ->
+        st
+          { evPendingUnfoldings = M.adjust (M.delete original) (evExScope st) (evPendingUnfoldings st)
+          }
+      return (Just typed)
+
+-- A GADT specialization can make an impossible branch ill-sorted. Select
+-- solver-justified branches before checking their specialized bodies, while
+-- retaining the caller's expected result independently of that selection.
+prepareUnfolding :: Knowledge -> ICtx -> EvalType -> Sort -> Expr -> EvalST (Either Expr Expr)
+prepareUnfolding γ ctx et expected body = do
+  (selected, unchangedGuard) <- selectUnfolding γ ctx et body
+  if unchangedGuard && et /= NoRWEta
+    then return (Left (ECst selected expected))
+    else Right <$> elaborateExpr "EvalApp typed unfolding" expected selected
+
+-- The Left result is only remembered, never directly asserted. If pending
+-- equations are requested, resSInfo strictly elaborates every pending
+-- predicate before strengthenBinds makes it available to the solver.
+rememberPending :: Expr -> Expr -> EvalST ()
+rememberPending original body = modify $ \st ->
+  st
+    { evPendingUnfoldings =
+        M.insertWith
+          M.union
+          (evExScope st)
+          (M.singleton original body)
+          (evPendingUnfoldings st)
+    }
+
+selectUnfolding :: Knowledge -> ICtx -> EvalType -> Expr -> EvalST (Expr, Bool)
+selectUnfolding γ ctx et (ECst e t) = do
+  (selected, unchanged) <- selectUnfolding γ ctx et e
+  return (ECst selected t, unchanged)
+selectUnfolding γ ctx et (ECoerc s t e) = do
+  (selected, unchanged) <- selectUnfolding γ ctx et e
+  return (ECoerc s t selected, unchanged)
+selectUnfolding γ ctx et (EIte predicate yes no) = do
+  (guardBody, _) <- selectUnfolding γ ctx et predicate
+  typedGuard <- elaborateExpr "EvalApp guard" boolSort guardBody
+  guardValue <- eval γ ctx et typedGuard
+  decision <- isValidCached γ guardValue
+  case decision of
+    Just True -> do
+      (selected, _) <- selectUnfolding γ ctx et yes
+      return (selected, False)
+    Just False -> do
+      (selected, _) <- selectUnfolding γ ctx et no
+      return (selected, False)
+    Nothing -> return (EIte guardValue yes no, guardValue == typedGuard)
+selectUnfolding _ _ _ e = return (e, False)
+
+elaborateExpr :: String -> Sort -> Expr -> EvalST Expr
+elaborateExpr msg expected e = do
   let elabSpan = atLoc dummySpan msg
   env <- get
   let symEnv' = insertsSymEnv (evEnv env) (evExScope env)
   ef <- gets evElabF
-  pure $ unApply $ elaborate (ElabParam ef elabSpan symEnv') e
+  pure $ unApply $ elaborate (ElabParam ef elabSpan symEnv') (ECst e expected)
 
 -- | Returns False if there is a fuel count in the evaluation environment and
 -- the fuel count exceeds the maximum. Returns True otherwise.

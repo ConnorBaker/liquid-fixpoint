@@ -826,9 +826,7 @@ elab f@(!_,!g) e@(PAtom !eq !e1 !e2) | eq == Eq || eq == Ne = do
   (!t1',!t2') <- unite g e t1 t2 `withError` errElabExpr e
   !e1'       <- elabAs f t1' e1
   !e2'       <- elabAs f t2' e2
-  !e1''      <- eCstAtom f e1' t1'
-  !e2''      <- eCstAtom f e2' t2'
-  return (PAtom eq e1'' e2'', boolSort)
+  return (PAtom eq (eCst e1' t1') (eCst e2' t2'), boolSort)
 
 elab !f (PAtom !r !e1 !e2)
   | r == Ueq || r == Une = do
@@ -867,19 +865,6 @@ elab !_ (ETApp _ _) =
   error "SortCheck.elab: TODO: implement ETApp"
 elab !_ (ETAbs _ _) =
   error "SortCheck.elab: TODO: implement ETAbs"
-
--- | 'eCstAtom' is to support tests like `tests/pos/undef00.fq`
-eCstAtom :: ElabEnv -> Expr -> Sort -> CheckM Expr
-eCstAtom f@(sym,g) (ECst (EVar x) _) t
-  | Found s <- g x
-  , isUndef s
-  , not (isNum sym t) = (`eCst` t) <$> elabAppAs f t (eVar tyCastName) (eVar x)
-eCstAtom _ e t = return (eCst e t)
-
-isUndef :: Sort -> Bool
-isUndef s = case bkAbs s of
-  (is, FVar j) -> j `elem` is
-  _            -> False
 
 elabAddEnv :: Eq a => (t, a -> SESearch b) -> [(a, b)] -> (t, a -> SESearch b)
 elabAddEnv (g, f) bs = (g, addEnv f bs)

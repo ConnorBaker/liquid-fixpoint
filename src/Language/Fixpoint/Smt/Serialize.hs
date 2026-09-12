@@ -168,52 +168,91 @@ instance SMTLIB2 Brel where
 
 -- NV TODO: change the way EApp is printed
 instance SMTLIB2 Expr where
-  smt2 (ESym z)         = smt2 z
-  smt2 (ECon c)         = smt2 c
-  smt2 (EVar x)         = smt2 x
-  smt2 e@(EApp _ _)     = smt2App e
-  smt2 (ENeg e)         = do s <- smt2 e
-                             pure $ parenSeqs ["-", s]
-  smt2 (EBin o e1 e2)   = do so <- smt2 o
-                             s1 <- smt2 e1
-                             s2 <- smt2 e2
-                             pure $ parenSeqs [so, s1, s2]
-  smt2 (ELet x e1 e2)   = do s1 <- smt2 (x, e1)
-                             s2 <- smt2 e2
-                             pure $ parenSeqs ["let", parens s1, s2]
-  smt2 (EIte e1 e2 e3)  = do s1 <- smt2 e1
-                             s2 <- smt2 e2
-                             s3 <- smt2 e3
-                             pure $ parenSeqs ["ite", s1, s2, s3]
-  smt2 (ECst e t)       = smt2Cast e t
-  smt2 PTrue            = pure "true"
-  smt2 PFalse           = pure "false"
-  smt2 (PAnd [])        = pure "true"
-  smt2 (PAnd ps)        = do s <- smt2s ps
-                             pure $ parenSeqs ["and", s]
-  smt2 (POr [])         = pure "false"
-  smt2 (POr ps)         = do s <- smt2s ps
-                             pure $ parenSeqs ["or", s]
-  smt2 (PNot p)         = do s <- smt2 p
-                             pure $ parenSeqs ["not", s]
-  smt2 (PImp p q)       = do s1 <- smt2 p
-                             s2 <- smt2 q
-                             pure $ parenSeqs ["=>", s1, s2]
-  smt2 (PIff p q)       = do s1 <- smt2 p
-                             s2 <- smt2 q
-                             pure $ parenSeqs ["=", s1, s2]
-  smt2 (PExist [] p)    = smt2 p
-  smt2 (PExist xs p)    = do s <- smt2s xs
-                             s1 <- smt2 p
-                             pure $ parenSeqs ["exists", parens s, s1]
-  smt2 (PAll   [] p)    = smt2 p
-  smt2 (PAll   xs p)    = do s <- smt2s xs
-                             s1 <- smt2 p
-                             pure $ parenSeqs ["forall", parens s, s1]
-  smt2 (PAtom r e1 e2)  = mkRel r e1 e2
-  smt2 (ELam b e)       = smt2Lam b e
+  smt2 (ESym z) = smt2 z
+  smt2 (ECon c) = smt2 c
+  smt2 (EVar x) = do
+    env <- get
+    case polyValueSort env x of
+      Just _ -> unresolvedPolyValue x
+      Nothing -> smt2 x
+  smt2 e@(EApp _ _) = smt2App e
+  smt2 (ENeg e) = do
+    s <- smt2 e
+    pure $ parenSeqs ["-", s]
+  smt2 (EBin o e1 e2) = do
+    so <- smt2 o
+    s1 <- smt2 e1
+    s2 <- smt2 e2
+    pure $ parenSeqs [so, s1, s2]
+  smt2 (ELet x e1 e2) = do
+    initializer <- smt2 e1
+    withSmtShadowing [x] $ do
+      name <- smt2 x
+      body <- smt2 e2
+      pure $ parenSeqs ["let", parens (parenSeqs [name, initializer]), body]
+  smt2 (EIte e1 e2 e3) = do
+    s1 <- smt2 e1
+    s2 <- smt2 e2
+    s3 <- smt2 e3
+    pure $ parenSeqs ["ite", s1, s2, s3]
+  smt2 (ECst e t) = smt2Cast e t
+  smt2 PTrue = pure "true"
+  smt2 PFalse = pure "false"
+  smt2 (PAnd []) = pure "true"
+  smt2 (PAnd ps) = do
+    s <- smt2s ps
+    pure $ parenSeqs ["and", s]
+  smt2 (POr []) = pure "false"
+  smt2 (POr ps) = do
+    s <- smt2s ps
+    pure $ parenSeqs ["or", s]
+  smt2 (PNot p) = do
+    s <- smt2 p
+    pure $ parenSeqs ["not", s]
+  smt2 (PImp p q) = do
+    s1 <- smt2 p
+    s2 <- smt2 q
+    pure $ parenSeqs ["=>", s1, s2]
+  smt2 (PIff p q) = do
+    s1 <- smt2 p
+    s2 <- smt2 q
+    pure $ parenSeqs ["=", s1, s2]
+  smt2 (PExist [] p) = smt2 p
+  smt2 (PExist xs p) = smt2Quantifier "exists" xs p
+  smt2 (PAll [] p) = smt2 p
+  smt2 (PAll xs p) = smt2Quantifier "forall" xs p
+  smt2 (PAtom r e1 e2) = mkRel r e1 e2
+  smt2 (ELam b e) = smt2Lam b e
   smt2 (ECoerc t1 t2 e) = smt2Coerc t1 t2 e
-  smt2 e                = panic ("smtlib2 Pred  " ++ show e)
+  smt2 e = panic ("smtlib2 Pred  " ++ show e)
+
+-- The nullary-family encoding currently covers free rank-1 constants.
+-- Quantifying over polymorphic families needs a separate higher-rank model;
+-- reject it explicitly instead of treating the family tag as its value.
+withSmtBinders :: [(Symbol, Sort)] -> SymM a -> SymM a
+withSmtBinders binders action
+  | any (isPolyValueSort . snd) binders
+  = panic "SMTLIB2: quantified polymorphic value families are not supported"
+  | otherwise = withSmtShadowing (map fst binders) $ do
+      modify (`insertsSymEnv` binders)
+      action
+
+-- Keep declarations discovered in the body, but restore lexical symbol
+-- information. SMT let/define-fun arguments are already monomorphic here.
+withSmtShadowing :: [Symbol] -> SymM a -> SymM a
+withSmtShadowing names action = do
+  previous <- get
+  modify (\env -> (deletesSymEnv env names)
+    { seTheory = foldr deleteSEnv (seTheory env) names })
+  result <- action
+  modify (\env -> env { seSort = seSort previous, seTheory = seTheory previous })
+  pure result
+
+smt2Quantifier :: Builder -> [(Symbol, Sort)] -> Expr -> SymM Builder
+smt2Quantifier quantifier binders body = withSmtBinders binders $ do
+  names <- smt2s binders
+  predicate <- smt2 body
+  pure $ parenSeqs [quantifier, parens names, predicate]
 
 -- | smt2Cast uses the 'as x T' pattern needed for polymorphic ADT constructors
 --   like Nil, see `tests/pos/adt_list_1.fq`
@@ -226,9 +265,46 @@ smt2Var :: Symbol -> Sort -> SymM Builder
 smt2Var x t
   | isLamArgSymbol x = smtLamArg x t
   | otherwise        = do env <- get
-                          case symEnvSort x env of
-                            Just s | isPolyInst s t -> smt2VarAs x t
-                            _                       -> smt2 x
+                          case polyValueSort env x of
+                            Just scheme -> smt2PolyValue x scheme t
+                            Nothing -> case symEnvTheory x env of
+                              Just theory
+                                | tsInterp theory == Ctor
+                                , isPolyInst (tsSort theory) t -> smt2VarAs x t
+                              _ -> smt2 x
+
+-- | A family identity and a logical instance ID select one value. Logical
+-- instance identity survives SMT erasure, including nested function sorts.
+-- Repeated occurrences select the same value; equality at one instance does
+-- not equate family identities or values at other instances.
+smt2PolyValue :: Symbol -> Sort -> Sort -> SymM Builder
+smt2PolyValue x _ FAbs{} = unresolvedPolyValue x
+smt2PolyValue x scheme t
+  | not (all (`occursInSort` body) variables) = panic
+      ("SMTLIB2: phantom type parameter in polymorphic value family "
+        ++ showpp x ++ "; its instance cannot be recovered from the result sort")
+  | otherwise = do
+      instanceIndex <- valueInstanceIndex t
+      applySymbol <- symbolAtName applyName (FFunc FInt t)
+      valueTag <- smt2 x
+      instanceTag <- smt2 instanceIndex
+      pure $ parenSeqs [Builder.fromText applySymbol, valueTag, instanceTag]
+  where
+    (variables, body) = bkAbs scheme
+
+occursInSort :: Int -> Sort -> Bool
+occursInSort variable = go
+  where
+    go (FVar index) = index == variable
+    go (FFunc argument result) = go argument || go result
+    go (FApp constructor argument) = go constructor || go argument
+    go (FAbs index body) = index /= variable && go body
+    go _ = False
+
+unresolvedPolyValue :: Symbol -> SymM a
+unresolvedPolyValue x = panic
+  ("SMTLIB2: uninstantiated polymorphic value family " ++ showpp x
+    ++ "; expected an explicit monomorphic result sort")
 
 smt2VarAs :: Symbol -> Sort -> SymM Builder
 smt2VarAs x t =
@@ -246,7 +322,8 @@ smtLamArg x t =
 
 smt2Lam :: (Symbol, Sort) -> Expr -> SymM Builder
 smt2Lam (x, xT) full@(ECst _ eT) =
-  do x' <- smtLamArg x xT
+  withSmtBinders [(x, xT)] $ do
+     x' <- smtLamArg x xT
      lambda <- symbolAtName lambdaName (FFunc xT eT)
      f <- smt2 full
      pure $ parenSeqs [Builder.fromText lambda, x', f]
@@ -308,7 +385,8 @@ instance SMTLIB2 Command where
   smt2     c@(Define t)        = do s <- smt2SortMono c t
                                     pure $ key "declare-sort" s
   smt2     (DefineFunc name paramxs rsort e) =
-    do n <- smt2 name
+    withSmtShadowing (map fst paramxs) $ do
+       n <- smt2 name
        bParams <- traverse (\(s, t) -> do s0 <- smt2 s
                                           s1 <- smt2 t
                                           pure $ parenSeqs [s0 , s1]) paramxs
@@ -331,8 +409,13 @@ instance SMTLIB2 Command where
   smt2     Push                = pure "(push 1)"
   smt2     Pop                 = pure "(pop 1)"
   smt2     CheckSat            = pure "(check-sat)"
-  smt2     (GetValue xs)       = do s <- smt2s xs
-                                    pure $ key "key-value" (parens s)
+  smt2     (GetValue xs)       = do
+    env <- get
+    case [x | x <- xs, Just _ <- [polyValueSort env x]] of
+      x : _ -> unresolvedPolyValue x
+      [] -> do
+        s <- smt2s xs
+        pure $ key "key-value" (parens s)
   smt2     (CMany cmds)        = smt2s cmds
   smt2     Exit                = pure "(exit)"
   smt2     SetMbqi             = pure "(set-option :smt.mbqi true)"

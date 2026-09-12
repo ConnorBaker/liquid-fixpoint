@@ -194,6 +194,7 @@ command !cmd       = do
   ctxSolver <- gets ctxSolver
   ctxVerbose <- gets ctxVerbose
   cmdBS <- liftSym $ runSmt2 cmd
+  declarePendingSorts
   forM_ ctxLog $ \h -> lift $ do
     BS.hPutBuilder h cmdBS
     LBS.hPutStr h "\n"
@@ -201,17 +202,6 @@ command !cmd       = do
     CheckSat   -> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
     GetValue _ -> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
     _          -> SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
-
--- | A variant of `command` that accepts a pre-built command
-commandB :: Builder -> SmtM Response
---------------------------------------------------------------------------------
-commandB cmdBS       = do
-  ctxLog <- gets ctxLog
-  ctxSolver <- gets ctxSolver
-  forM_ ctxLog $ \h -> lift $ do
-    BS.hPutBuilder h cmdBS
-    LBS.hPutStr h "\n"
-  lift $ SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
 
 smtSetMbqi :: SmtM ()
 smtSetMbqi = interact' SetMbqi
@@ -416,7 +406,10 @@ smtDecl x t = do
   let env = seData (ctxSymEnv me)
   let ins' = sortSmtSort False env <$> ins
   let out' = sortSmtSort False env     out
-  interact' (notracepp _msg $ Declare (symbolSafeText x) ins' out')
+  let declaration = case polyValueSort (ctxSymEnv me) x of
+        Just _ -> Declare (symbolSafeText x) [] SInt
+        Nothing -> Declare (symbolSafeText x) ins' out'
+  interact' (notracepp _msg declaration)
   where
     (ins, out) = deconSort t
     _msg       = "smtDecl: " ++ showpp (x, t, ins, out)
@@ -435,10 +428,9 @@ deconSort t = case functionSort t of
 smtAssert :: Expr -> SmtM ()
 smtAssert p = interact' (Assert Nothing p)
 
--- the following three functions will emit additional `apply`,
--- `coerce`, and `lambda` symbols for fresh function sorts as needed
+-- All commands emit declarations for freshly encountered function sorts.
 smtAssertDecl :: HasCallStack => Expr -> SmtM ()
-smtAssertDecl p = interactDecl' (Assert Nothing p)
+smtAssertDecl p = interact' (Assert Nothing p)
 
 smtDefineEqn :: Equation -> SmtM ()
 smtDefineEqn Equ {..} = smtDefineFunc eqName eqArgs eqSort eqBody
@@ -446,7 +438,7 @@ smtDefineEqn Equ {..} = smtDefineFunc eqName eqArgs eqSort eqBody
 smtDefineFunc :: Symbol -> [(Symbol, F.Sort)] -> F.Sort -> Expr -> SmtM ()
 smtDefineFunc name symList rsort e =
   do env <- gets (seData . ctxSymEnv)
-     interactDecl' $
+     interact' $
         DefineFunc
           name
           (map (sortSmtSort False env <$>) symList)
@@ -498,17 +490,16 @@ respSat r       = die $ err dummySpan $ text ("crash: SMTLIB2 respSat = " ++ sho
 interact' :: Command -> SmtM ()
 interact' cmd  = void $ command cmd
 
--- | a variant of `interact'` which also emits fresh
---   `apply`, `coerce`, and `lambda` symbols
-interactDecl' :: HasCallStack => Command -> SmtM ()
-interactDecl' cmd  = do
-  cmdBS <- liftSym $ runSmt2 cmd
+-- Clear the nursery before emitting declarations, since declaring a symbol
+-- itself uses 'command'. Recursive declaration commands then see no pending
+-- work. Every public command path consequently declares symbols before use.
+declarePendingSorts :: HasCallStack => SmtM ()
+declarePendingSorts = do
   ctx <- get
   let env = ctxSymEnv ctx
   let ats = funcSortVars (ctxLams ctx) env
-  forM_ ats $ uncurry smtFuncDecl
   put (ctx {ctxSymEnv = env {seAppls = mergeTopAppls (seApplsCur env) (seAppls env), seApplsCur = M.empty} })
-  void $ commandB cmdBS
+  forM_ ats $ uncurry smtFuncDecl
 
 makeTimeout :: Config -> [Builder]
 makeTimeout cfg

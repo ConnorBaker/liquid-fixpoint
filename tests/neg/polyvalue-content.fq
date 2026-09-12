@@ -1,0 +1,10 @@
+// Transport may not invent a content property of the arbitrary value.
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+constant consume : func(0, [Token; int])
+
+constraint:
+  env []
+  lhs {v : int | v = consume undef}
+  rhs {v : int | v >= 0}
+  id 0 tag []

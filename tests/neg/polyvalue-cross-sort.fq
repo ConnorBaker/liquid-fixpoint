@@ -1,0 +1,12 @@
+// Equality at one type must not equate two entire polymorphic families.
+// Class-method dictionaries have been erased; these are not empty Haskell types.
+data Token 0 = [ | First {} | Second {} ]
+constant firstFamily : func(1, [@(0)])
+constant secondFamily : func(1, [@(0)])
+bind 0 coincidence : {v : int | v = firstFamily && v = secondFamily}
+
+constraint:
+  env [0]
+  lhs {v : Token | v = firstFamily}
+  rhs {v : Token | v = secondFamily}
+  id 0 tag []

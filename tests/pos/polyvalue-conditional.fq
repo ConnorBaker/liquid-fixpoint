@@ -1,0 +1,13 @@
+// Elaborated conditionals, equality, and application share the same instance.
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+constant consume : func(0, [Token; int])
+bind 0 flag : {v : bool | []}
+bind 1 witness : {v : Token | v = undef}
+bind 2 result : {v : int | v = consume witness}
+
+constraint:
+  env [0; 1; 2]
+  lhs {v : int | v = result}
+  rhs {v : int | v = consume (if flag then undef else witness)}
+  id 0 tag []

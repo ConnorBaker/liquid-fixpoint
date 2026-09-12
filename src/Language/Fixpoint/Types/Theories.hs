@@ -35,6 +35,10 @@ module Language.Fixpoint.Types.Theories (
     , symEnv
     , symEnvSort
     , symEnvTheory
+    , polyValueSort
+    , isPolyValueSort
+    , valueInstanceIndex
+    , normalizeValueInstance
     , insertSymEnv
     , deleteSymEnv
     , insertsSymEnv
@@ -55,6 +59,7 @@ import           Data.Typeable             (Typeable)
 import           Data.Hashable
 import           GHC.Generics              (Generic)
 import           Control.Applicative
+import           Control.Monad            (guard)
 import           Control.Monad.State
 import           Control.DeepSeq
 import           Language.Fixpoint.Types.Config
@@ -62,6 +67,7 @@ import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Names
 import           Language.Fixpoint.Types.Sorts
 import           Language.Fixpoint.Types.Environments
+import           Language.Fixpoint.Types.Spans (dummyLoc)
 
 import           Text.PrettyPrint.HughesPJ.Compat
 import qualified Data.List                as L
@@ -69,6 +75,7 @@ import           Data.Text (Text)
 import qualified Data.Text                as Text
 import qualified Data.Store              as S
 import qualified Data.HashMap.Strict      as M
+import qualified Data.Map.Strict          as Map
 import qualified Language.Fixpoint.Misc   as Misc
 
 --------------------------------------------------------------------------------
@@ -134,6 +141,8 @@ data SymEnv = SymEnv
     -- 'seAppls' stack, and @seApplsCur@ is cleared.
   , seApplsCur :: !(M.HashMap FuncSort Int)
   , seIx       :: !Int                      -- ^ Largest unused index for sorts
+  , seValueInsts :: !(Map.Map Sort Int)     -- ^ Logical family instances, before SMT erasure
+  , seValueIx  :: !Int                      -- ^ Monotone; unlike seIx, never rewound on pop
   , seString   :: !Bool                     -- ^ Use string literals
   }
   deriving (Eq, Show, Data, Typeable, Generic)
@@ -159,15 +168,19 @@ instance Semigroup SymEnv where
                     , seAppls    = zipWith (<>) (seAppls e1) (seAppls e2)
                     , seApplsCur = seApplsCur e1 <> seApplsCur e2
                     , seIx       = seIx       e1 `max` seIx    e2
+                    , seValueInsts = instances
+                    , seValueIx = maximum (seValueIx e1 : seValueIx e2 : map (+ 1) (Map.elems instances))
                     , seString   = seString e1 && seString e2
                     }
+    where
+      instances = mergeValueInstances (seValueInsts e1) (seValueInsts e2)
 
 instance Monoid SymEnv where
-  mempty        = SymEnv emptySEnv emptySEnv emptySEnv emptySEnv [] mempty 0 True
+  mempty        = SymEnv emptySEnv emptySEnv emptySEnv emptySEnv [] mempty 0 Map.empty 0 True
   mappend       = (<>)
 
 symEnv :: Config -> SEnv Sort -> SEnv TheorySymbol -> [DataDecl] -> SEnv Sort -> [Sort] -> SymEnv
-symEnv cfg xEnv fEnv ds ls _ = SymEnv xEnv' fEnv dEnv ls [] mempty 0 seStr
+symEnv cfg xEnv fEnv ds ls _ = SymEnv xEnv' fEnv dEnv ls [] mempty 0 Map.empty 0 seStr
   where
     xEnv'   = unionSEnv xEnv wiredInEnv
     dEnv    = fromListSEnv [(symbol d, d) | d <- ds]
@@ -187,6 +200,71 @@ symEnvTheory x env = lookupSEnv x (seTheory env)
 
 symEnvSort :: Symbol -> SymEnv -> Maybe Sort
 symEnvSort   x env = lookupSEnv x (seSort env)
+
+-- | A non-theory polymorphic value denotes a family of values, not an SMT
+-- datatype constructor. Its SMT representation is an identity tag; each
+-- instantiated value is obtained through a sort-indexed application.
+-- Functions already have an identity-tag representation of their own.
+polyValueSort :: SymEnv -> Symbol -> Maybe Sort
+polyValueSort env x = do
+  s <- symEnvSort x env
+  guard (isPolyValueSort s)
+  guard (case symEnvTheory x env of
+    Nothing -> True
+    Just theory -> tsInterp theory == Uninterp)
+  -- Declaring an identity does not select an instance. Recoverability is checked
+  -- when an instantiated occurrence is serialized, not for an unused scheme.
+  pure s
+
+isPolyValueSort :: Sort -> Bool
+isPolyValueSort s = not (null variables) && case body of
+  FFunc {} -> False
+  FApp (FApp constructor _) _ | constructor == funcSort -> False
+  _ -> True
+  where
+    (variables, body) = bkAbs s
+
+-- Logical function structure survives even though both functions and Int
+-- have SMT sort Int. Canonicalize the two function-sort syntaxes recursively.
+-- Floating logical variables retain the pre-existing Int-erasure convention.
+-- Canonical constructor locations also make the Map's Ord key agree with
+-- FTycon equality, which compares names rather than source locations.
+normalizeValueInstance :: Sort -> Maybe Sort
+normalizeValueInstance = go
+  where
+    go FAbs{} = Nothing
+    go FVar{} = Just FInt
+    go FObj{} = Just FInt
+    go (FFunc argument result) = go (FApp (FApp funcSort argument) result)
+    go (FApp constructor argument) = FApp <$> go constructor <*> go argument
+    go (FTC constructor) = Just (FTC (symbolFTycon (dummyLoc (symbol constructor))))
+    go sort = Just sort
+
+valueInstanceIndex :: Sort -> SymM Int
+valueInstanceIndex sort = case normalizeValueInstance sort of
+  Nothing -> Misc.errorstar "SMTLIB2: higher-rank polymorphic value instance is not supported"
+  Just instanceSort -> do
+    env <- get
+    case Map.lookup instanceSort (seValueInsts env) of
+      Just index -> pure index
+      Nothing -> do
+        let index = seValueIx env
+        put env { seValueInsts = Map.insert instanceSort index (seValueInsts env)
+                , seValueIx = index + 1 }
+        pure index
+
+-- Already-emitted literal IDs cannot be renamed when two environments merge.
+-- Compatible subsets can be combined; conflicting live interpretations fail
+-- explicitly instead of silently identifying distinct logical instances.
+mergeValueInstances :: Map.Map Sort Int -> Map.Map Sort Int -> Map.Map Sort Int
+mergeValueInstances left right
+  | all compatible (Map.toList right)
+  , Map.size inverse == Map.size combined = combined
+  | otherwise = Misc.errorstar "SMTLIB2: incompatible polymorphic value instance registries"
+  where
+    combined = Map.union left right
+    inverse = Map.fromList [(index, sort) | (sort, index) <- Map.toList combined]
+    compatible (sort, index) = maybe True (== index) (Map.lookup sort left)
 
 insertSymEnv :: Symbol -> Sort -> SymEnv -> SymEnv
 insertSymEnv x t env = env { seSort = insertSEnv x t (seSort env) }
@@ -400,5 +478,7 @@ coerceEnv slv env =
          , seAppls    = seAppls  env
          , seApplsCur = seApplsCur env
          , seIx       = seIx     env
+         , seValueInsts = seValueInsts env
+         , seValueIx = seValueIx env
          , seString   = seString env
          }

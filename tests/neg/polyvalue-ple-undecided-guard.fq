@@ -1,0 +1,14 @@
+fixpoint "--rewrite"
+fixpoint "--fuel=1"
+data Token 0 = [ | First {} | Second {} ]
+constant empty : func(1, [Set_Set @(0)])
+constant guarded : func(0, [int; Set_Set Token])
+define guarded (n : int) : Set_Set Token = {if n = 0 then empty else guarded (n - 1)}
+bind 0 unknown : {v : int | []}
+bind 1 witness : {v : Set_Set Token | v = empty}
+constraint:
+  env [0; 1]
+  lhs {v : Set_Set Token | v = guarded unknown}
+  rhs {v : Set_Set Token | v = witness}
+  id 0 tag []
+expand [0 : True]
