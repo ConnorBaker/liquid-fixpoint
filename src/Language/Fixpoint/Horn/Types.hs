@@ -44,6 +44,7 @@ import qualified Data.Text               as T
 import           Data.Maybe (fromMaybe)
 import qualified Data.List               as L
 import qualified Language.Fixpoint.Types as F
+import qualified Language.Fixpoint.Types.Visitor as V
 import qualified Text.PrettyPrint.HughesPJ.Compat as P
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
@@ -112,7 +113,7 @@ predQuals env v (PAnd ps) = concatMap (predQuals env v) ps
 predQuals _   _ _         = []
 
 exprQuals :: F.SEnv F.Sort -> F.Symbol -> F.Expr -> [F.Qualifier]
-exprQuals env v e = mkQual env v <$> F.conjuncts e
+exprQuals env v e = mkQual env v <$> filter V.isConc (F.conjuncts e)
 
 mkQual :: F.SEnv F.Sort -> F.Symbol -> F.Expr -> F.Qualifier
 mkQual env v p = case envSort env <$> (v:xs) of

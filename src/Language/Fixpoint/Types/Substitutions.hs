@@ -199,17 +199,17 @@ class Refreshable v where
   candidates :: v -> [v]
 
 instance Refreshable Symbol where
-  candidates x =
-     let (x', i) = splitIntSuffix x
-      in x : map (intSymbol x') [i..]
-    where
-      splitIntSuffix sx =
-        case T.breakOnEnd symSepName (symbolText sx) of
-          (pfx, sfx)
-            | T.null pfx -> (sx, 0 :: Int)
-            | otherwise  -> case reads (T.unpack sfx) of
-              ((i, []) : _) -> (unSuffixSymbol sx, i + 1 :: Int)
-              _ -> (sx, 0 :: Int)
+    candidates x =
+        let (x', i) = splitIntSuffix x
+         in x : map (\j -> symbol (x' <> symSepName <> T.pack (show j))) [i ..]
+      where
+        splitIntSuffix sx =
+            case T.breakOnEnd symSepName (symbolText sx) of
+                (pfx, sfx)
+                    | T.null pfx -> (symbolText sx, 0 :: Integer)
+                    | otherwise -> case reads (T.unpack sfx) of
+                        ((i, []) : _) -> (T.dropEnd (T.length symSepName) pfx, i + 1 :: Integer)
+                        _ -> (symbolText sx, 0 :: Integer)
 
 -- | Rapier style capture-avoiding substitution
 --
@@ -221,6 +221,8 @@ rapierSubstExpr = go
   where
     go s su e0 = case e0 of
         EApp f e -> EApp (go s su f) (go s su e)
+        ETApp e t -> ETApp (go s su e) t
+        ETAbs e x -> ETAbs (go s su e) x
         ELam (x, t) e ->
           let (s', x') = freshInNS x s
               su' = extendSubstWithVar su x x'

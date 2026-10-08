@@ -48,7 +48,7 @@ sanitize cfg =       banIrregularData
          >=> Misc.fM replaceDeadKvars
          >=> Misc.fM (dropDeadSubsts . restrictKVarDomain cfg)
          >=>         banMixedRhs
-         >=>         banQualifFreeVars cfg
+         >=>         checkQualifiers cfg
          >=>         banConstraintFreeVars cfg
          >=> Misc.fM addLiterals
          >=> Misc.fM (eliminateEta cfg)
@@ -206,7 +206,7 @@ restrictKVarDomain cfg si
   | Cfg.explicitKvars cfg = si
   | otherwise             = si { F.ws = M.mapWithKey (restrictWf kvm) (F.ws si) }
   where
-    kvm                   = safeKvarEnv si
+    kvm                   = safeKvarEnv cfg si
 
 -- | `restrictWf kve k w` restricts the env of `w` to the parameters in `kve k`.
 restrictWf :: KvDom -> F.KVar -> F.WfC a -> F.WfC a
@@ -224,48 +224,46 @@ type KvBads    = M.HashMap F.KVar [F.Symbol]
 --   `x` which appear in substitutions of the form `K[x := y]`
 --   where `y` is not in the env.
 
-safeKvarEnv :: F.SInfo a -> KvDom
-safeKvarEnv si = L.foldl' (dropKvarEnv si) env0 cs
-  where
-    cs         = M.elems  (F.cm si)
-    env0       = initKvarEnv si
+safeKvarEnv :: Config -> F.SInfo a -> KvDom
+safeKvarEnv cfg si = L.foldl' (dropKvarEnv cfg si) env0 cs
+ where
+  cs = M.elems (F.cm si)
+  env0 = initKvarEnv si
 
-
-dropKvarEnv :: F.SInfo a -> KvDom -> F.SimpC a -> KvDom
-dropKvarEnv si kve c = M.mapWithKey (dropBadParams kBads) kve
-  where
-    kBads            = badParams si c
+dropKvarEnv :: Config -> F.SInfo a -> KvDom -> F.SimpC a -> KvDom
+dropKvarEnv cfg si kve c = M.mapWithKey (dropBadParams kBads) kve
+ where
+  kBads = badParams cfg si c
 
 dropBadParams :: KvBads -> F.KVar -> F.SEnv F.BindId -> F.SEnv F.BindId
 dropBadParams kBads k kEnv = L.foldl' (flip F.deleteSEnv) kEnv xs
-  where
-    xs                     = M.lookupDefault mempty k kBads
+ where
+  xs = M.lookupDefault mempty k kBads
 
-badParams :: F.SInfo a -> F.SimpC a -> M.HashMap F.KVar [F.Symbol]
-badParams si c = Misc.group bads
-  where
-    bads       = [ (k, x) | (v, k, su) <- subcKSubs xsrs c
-                          , let vEnv = maybe sEnv (`S.insert` sEnv) v
-                          , (x, e)          <- M.toList (F.fromKVarSubst su)
-                          , badArg vEnv e
-                 ]
-    sEnv       = S.fromList (fst <$> xsrs)
-    xsrs       = F.envCs (F.bs si) (F.senv c)
+badParams :: Config -> F.SInfo a -> F.SimpC a -> M.HashMap F.KVar [F.Symbol]
+badParams cfg si c = Misc.group bads
+ where
+  bads =
+    [ (k, x)
+    | (v, k, su) <- subcKSubs xsrs c
+    , let vEnv = maybe sEnv (`S.insert` sEnv) v
+    , (x, e) <- M.toList (F.fromKVarSubst su)
+    , badArg vEnv e
+    ]
+  sEnv = S.fromList (map fst xsrs ++ map fst (F.toListSEnv (SortCheck.globalEnv cfg si)))
+  xsrs = F.envCs (F.bs si) (F.senv c)
 
 badArg :: S.HashSet F.Symbol -> F.Expr -> Bool
-badArg sEnv (F.EVar y) = not (y `S.member` sEnv)
-badArg _    _          = True
+badArg sEnv e = not (F.syms e `S.isSubsetOf` sEnv)
 
 type KSub = (Maybe F.Symbol, F.KVar, F.KVarSubst F.Symbol F.Symbol)
 
 subcKSubs :: [(F.Symbol, F.SortedReft)] -> F.SimpC a -> [KSub]
 subcKSubs xsrs c = rhs ++ lhs
-  where
-    lhs          = [ (Just v, k, su) | (_, sr) <- xsrs
-                                     , let rs   = F.reftConjuncts (F.sr_reft sr)
-                                     , F.Reft (v, F.PKVar k _ su) <- rs
-                   ]
-    rhs          = [(Nothing, k, su) | F.PKVar k _ su <- [F.crhs c]]
+ where
+  lhs = concat [occurrences (Just v) p | (_, F.RR _ (F.Reft (v, p))) <- xsrs]
+  rhs = occurrences Nothing (F.crhs c)
+  occurrences v e = [(v, k, su) | (k, sus) <- M.toList (F.exprKVars e), su <- sus]
 
 
 initKvarEnv :: F.SInfo a -> KvDom
@@ -320,18 +318,24 @@ badDataDecl :: Misc.ListNE F.DataDecl -> E.Error
 badDataDecl ds = E.catErrors [ E.errBadDataDecl d | d <- ds ]
 
 --------------------------------------------------------------------------------
--- | check that no qualifier has free variables
+-- | Qualifiers are concrete predicates over their parameters and globals.
+-- Unlike automatically mined candidates, malformed declarations are errors.
 --------------------------------------------------------------------------------
-banQualifFreeVars :: Config -> F.SInfo a -> SanitizeM (F.SInfo a)
+checkQualifiers :: Config -> F.SInfo a -> SanitizeM (F.SInfo a)
 --------------------------------------------------------------------------------
-banQualifFreeVars cfg fi = Misc.applyNonNull (Right fi) (Left . badQuals) bads
-  where
-    bads    = [ (q, xs) | q <- F.quals fi, let xs = free q, not (S.null xs) ]
-    free q  = S.filter (not . isGlobal) (F.syms q)
-    isGlobal x = F.memberSEnv x (SortCheck.globalEnv cfg fi)
-
-badQuals     :: Misc.ListNE (F.Qualifier, S.HashSet F.Symbol) -> E.Error
-badQuals bqs = E.catErrors [ E.errFreeVarInQual q xs | (q, xs) <- bqs]
+checkQualifiers cfg fi = Misc.applyNonNull (Right fi) (Left . E.catErrors) bads
+ where
+  bads =
+    concat
+      [ [ E.err (F.srcSpan q) (vcat ["Qualifier contains unknown predicates", pprint q, pprint ks])
+        | let ks = M.keys (F.exprKVars (F.qBody q))
+        , not (null ks)
+        ]
+          ++ [E.errFreeVarInQual q xs | let xs = free q, not (S.null xs)]
+      | q <- F.quals fi
+      ]
+  free q = S.filter (not . isGlobal) (F.syms q)
+  isGlobal x = F.memberSEnv x (SortCheck.globalEnv cfg fi)
 
 
 --------------------------------------------------------------------------------
@@ -369,7 +373,7 @@ symbolEnv cfg si = F.symEnv cfg sEnv thyEnv ds lits (ts ++ ts')
     thyEnv       = theoryEnv cfg si
     ds           = F.ddecls si
     ts           = Misc.setNub (applySorts si ++ [t | (_, t) <- F.toListSEnv sEnv])
-    sEnv         = F.coerceSortEnv ef $ (F.tsSort <$> thyEnv) `mappend` F.fromListSEnv xts
+    sEnv         = (F.tsSort <$> thyEnv) `mappend` F.fromListSEnv xts
     ef           = solverFlags cfg
     xts          = symbolSorts cfg si ++ alits
     lits         = F.dLits si `F.unionSEnv'` F.fromListSEnv alits

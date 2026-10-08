@@ -60,6 +60,10 @@ module Language.Fixpoint.Types.Sorts (
 
   , mkSortSubst
   , sortSubst
+  , sortSubstVars
+  , substituteSort
+  , sortIndices
+  , freeSortIndices
   , SortSubst
   , functionSort
   , mkFFunc
@@ -88,10 +92,6 @@ module Language.Fixpoint.Types.Sorts (
   , tceInsertWith
   , tceMap
 
-  -- * Sort coercion for SMT theory encoding
-  , coerceMapToArray
-  , coerceSetBagToArray
-  , coerceDataDecl
   ) where
 
 import qualified Data.Store as S
@@ -109,13 +109,13 @@ import           Data.List                 (foldl')
 #endif
 import           Control.DeepSeq
 import           Data.Maybe                (fromMaybe)
-import           Language.Fixpoint.Types.Config (ElabFlags, elabSetBag)
 import           Language.Fixpoint.Types.Names
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Spans
 import           Language.Fixpoint.Misc
 import           Text.PrettyPrint.HughesPJ.Compat
 import qualified Data.HashMap.Strict       as M
+import qualified Data.IntMap.Strict        as IM
 import qualified Data.List                 as L
 import qualified Data.Binary as B
 import Text.Read (readMaybe)
@@ -636,13 +636,66 @@ mkSortSubst :: [(Symbol, Sort)] -> SortSubst
 mkSortSubst = M.fromList
 
 ------------------------------------------------------------------------
-sortSubst                 :: SortSubst -> Sort -> Sort
+sortSubst :: SortSubst -> Sort -> Sort
 ------------------------------------------------------------------------
-sortSubst θ t@(FObj x)    = fromMaybe t (M.lookup x θ)
-sortSubst θ (FFunc t1 t2) = FFunc (sortSubst θ t1) (sortSubst θ t2)
-sortSubst θ (FApp t1 t2)  = FApp  (sortSubst θ t1) (sortSubst θ t2)
-sortSubst θ (FAbs i t)    = FAbs i (sortSubst θ t)
-sortSubst _  t            = t
+sortSubst θ = substituteSort θ IM.empty
+
+{- | Simultaneous substitution of free indexed coordinates. Both coordinate
+actions share the same lexical binder ownership and capture avoidance.
+-}
+sortSubstVars :: IM.IntMap Sort -> Sort -> Sort
+sortSubstVars = substituteSort M.empty
+
+substituteSort :: SortSubst -> IM.IntMap Sort -> Sort -> Sort
+substituteSort symbolic indexed target
+    | M.null symbolic && IM.null indexed = target
+    | otherwise = go M.empty occupied target
+  where
+    active = M.filterWithKey (\name _ -> HashSet.member name names) symbolic
+    variables = IM.filterWithKey (\index _ -> HashSet.member index free) indexed
+    names = sortSymbols target
+    free = freeSortIndices target
+    ranges = M.elems active ++ IM.elems variables
+    rangeFree = HashSet.unions (map freeSortIndices ranges)
+    occupied = HashSet.unions (sortIndices target : map sortIndices ranges)
+
+    -- Images are inserted once with their own lexical ownership. Only the
+    -- original target's bound occurrences follow this renaming environment.
+    -- Direct lookup needs no support inventory; the filtered image inventories
+    -- above are demanded only for capture avoidance at a type binder.
+    go :: M.HashMap Int Int -> HashSet Int -> Sort -> Sort
+    go _ _ t@(FObj x) = M.lookupDefault t x symbolic
+    go bound _ (FVar i) = case M.lookup i bound of
+        Just j -> FVar j
+        Nothing -> IM.findWithDefault (FVar i) i indexed
+    go bound used (FFunc x y) = FFunc (go bound used x) (go bound used y)
+    go bound used (FApp x y) = FApp (go bound used x) (go bound used y)
+    go bound used (FAbs i body) =
+        let j = if HashSet.member i rangeFree then freshIndex used else i
+         in FAbs j (go (M.insert i j bound) (HashSet.insert j used) body)
+    go _ _ t = t
+
+    freshIndex :: HashSet Int -> Int
+    freshIndex used = search 0
+      where
+        search i
+            | not (HashSet.member i used) = i
+            | i == maxBound = error "sortSubst: exhausted sort-variable indices"
+            | otherwise = search (i + 1)
+
+freeSortIndices :: Sort -> HashSet Int
+freeSortIndices (FVar i) = HashSet.singleton i
+freeSortIndices (FAbs i body) = HashSet.delete i (freeSortIndices body)
+freeSortIndices (FFunc x y) = HashSet.union (freeSortIndices x) (freeSortIndices y)
+freeSortIndices (FApp x y) = HashSet.union (freeSortIndices x) (freeSortIndices y)
+freeSortIndices _ = HashSet.empty
+
+sortIndices :: Sort -> HashSet Int
+sortIndices (FVar i) = HashSet.singleton i
+sortIndices (FAbs i body) = HashSet.insert i (sortIndices body)
+sortIndices (FFunc x y) = HashSet.union (sortIndices x) (sortIndices y)
+sortIndices (FApp x y) = HashSet.union (sortIndices x) (sortIndices y)
+sortIndices _ = HashSet.empty
 
 -- instance (S.Store a) => S.Store (TCEmb a)
 instance S.Store TCArgs
@@ -731,34 +784,3 @@ tceToList (TCE m) = M.toList m
 
 tceMember :: (Eq a, Hashable a) => a -> TCEmb a -> Bool
 tceMember k (TCE m) = M.member k m
-
--------------------------------------------------------------------------------
--- | Sort coercion for SMT theory encoding
--------------------------------------------------------------------------------
-
-coerceMapToArray :: Sort -> Sort
-coerceMapToArray (FFunc sf sa) = FFunc (coerceMapToArray sf) (coerceMapToArray sa)
-coerceMapToArray (FAbs i sa)   = FAbs i (coerceMapToArray sa)
-coerceMapToArray (FApp (FApp sf sa) sb)
-  | isMap sf = arraySort (coerceMapToArray sa) (coerceMapToArray sb)
-  | otherwise = FApp (FApp (coerceMapToArray sf) (coerceMapToArray sa)) (coerceMapToArray sb)
-coerceMapToArray (FApp sf sa) = FApp (coerceMapToArray sf) (coerceMapToArray sa)
-coerceMapToArray s = s
-
-coerceSetBagToArray :: Sort -> Sort
-coerceSetBagToArray (FFunc sf sa) = FFunc (coerceSetBagToArray sf) (coerceSetBagToArray sa)
-coerceSetBagToArray (FAbs i sa)   = FAbs i (coerceSetBagToArray sa)
-coerceSetBagToArray (FApp sf sa)
-  | isSet sf = arraySort (coerceSetBagToArray sa) boolSort
-  | isBag sf = arraySort (coerceSetBagToArray sa) intSort
-  | otherwise = FApp (coerceSetBagToArray sf) (coerceSetBagToArray sa)
-coerceSetBagToArray s = s
-
-coerceDataField :: ElabFlags -> DataField -> DataField
-coerceDataField ef (DField x t)  = DField x (((if elabSetBag ef then coerceSetBagToArray else id) . coerceMapToArray) t)
-
-coerceDataCtor :: ElabFlags -> DataCtor -> DataCtor
-coerceDataCtor ef (DCtor x flds) = DCtor x (coerceDataField ef <$> flds)
-
-coerceDataDecl :: ElabFlags -> DataDecl -> DataDecl
-coerceDataDecl ef (DDecl tc n ctors) = DDecl tc n (coerceDataCtor ef <$> ctors)

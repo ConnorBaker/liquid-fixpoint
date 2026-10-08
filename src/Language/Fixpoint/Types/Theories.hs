@@ -22,6 +22,9 @@ module Language.Fixpoint.Types.Theories (
     , SmtSort (..)
     , FuncSort
     , sortSmtSort
+    , sortSmtSortWithVars
+    , resolveNumericKind
+    , resolveNumericSort
     , isIntSmtSort
 
     , mergeTopAppls
@@ -35,6 +38,9 @@ module Language.Fixpoint.Types.Theories (
     , symEnv
     , symEnvSort
     , symEnvTheory
+    , polyValueSort
+    , isPolyValueSort
+    , normalizeValueInstance
     , insertSymEnv
     , deleteSymEnv
     , insertsSymEnv
@@ -42,10 +48,6 @@ module Language.Fixpoint.Types.Theories (
     , symbolAtName
     , symbolAtSortIndex
 
-    -- * Coercing sorts in environments
-    , coerceSort
-    , coerceEnv
-    , coerceSortEnv
     , TheorySymbols(..)
     ) where
 
@@ -55,6 +57,7 @@ import           Data.Typeable             (Typeable)
 import           Data.Hashable
 import           GHC.Generics              (Generic)
 import           Control.Applicative
+import           Control.Monad              (guard)
 import           Control.Monad.State
 import           Control.DeepSeq
 import           Language.Fixpoint.Types.Config
@@ -112,66 +115,102 @@ peekAppls [] = Nothing
 peekAppls (x:_) = Just x
 
 data SymEnv = SymEnv
-  { seSort     :: !(SEnv Sort)              -- ^ Sorts of *all* defined symbols
-  , seTheory   :: !(SEnv TheorySymbol)      -- ^ Information about theory-specific Symbols
-  , seData     :: !(SEnv DataDecl)          -- ^ User-defined data-declarations
-  , seLits     :: !(SEnv Sort)              -- ^ Distinct Constant symbols
+    { seSort :: !(SEnv Sort)
+    -- ^ Sorts of *all* defined symbols
+    , seTheory :: !(SEnv TheorySymbol)
+    -- ^ Information about theory-specific Symbols
+    , seData :: !(SEnv DataDecl)
+    -- ^ User-defined data-declarations
+    , seLits :: !(SEnv Sort)
+    -- ^ Distinct Constant symbols
+    , seAppls :: !Appls
+    {- ^ Apply tags already declared in the SMT solver.
 
-    -- | Apply tags already declared in the SMT solver.
-    --
-    -- This is inspected when serializing applications of functions to determine
-    -- if a new tag needs to be created for a given function sort
-    -- (@funcSortIndex@).
-  , seAppls    :: !Appls
+    This is inspected when serializing applications of functions to determine
+    if a new tag needs to be created for a given function sort
+    (@funcSortIndex@).
+    -}
+    , seApplsCur :: !(M.HashMap FuncSort Int)
+    {- ^ Apply tags that have been created while serializing expressions for the
+    SMT solver, but which have not been used to declare apply symbols yet in
+    the SMT solver.
 
-    -- | Apply tags that have been created while serializing expressions for the
-    -- SMT solver, but which have not been used to declare apply symbols yet in
-    -- the SMT solver.
-    --
-    -- The apply symbols using the tags are declared whenever we need to send
-    -- the serialized expressions to the SMT solver (using @funcSortVars@). At
-    -- this point, the contents of this map are merged into the top of the
-    -- 'seAppls' stack, and @seApplsCur@ is cleared.
-  , seApplsCur :: !(M.HashMap FuncSort Int)
-  , seIx       :: !Int                      -- ^ Largest unused index for sorts
-  , seString   :: !Bool                     -- ^ Use string literals
-  }
-  deriving (Eq, Show, Data, Typeable, Generic)
+    The apply symbols using the tags are declared whenever we need to send
+    the serialized expressions to the SMT solver (using @funcSortVars@). At
+    this point, the contents of this map are merged into the top of the
+    'seAppls' stack, and @seApplsCur@ is cleared.
+    -}
+    , -- Values requiring an SMT declaration for each selected logical instance.
+      -- Native callables use Int tags; ordinary polymorphic values use their
+      -- selected carrier. Both follow the enclosing solver declaration scope.
+      seInstances :: ![M.HashMap (Symbol, Sort) Symbol]
+    , seInstancesCur :: !(M.HashMap (Symbol, Sort) Symbol)
+    , seIx :: !Int
+    -- ^ Largest unused index for sorts
+    , seString :: !Bool
+    -- ^ Use string literals
+    , seSetBag :: !Bool
+    -- ^ Encode source sets and bags as arrays at the SMT boundary.
+    }
+    deriving (Eq, Show, Data, Typeable, Generic)
 
 {- type FuncSort = {v:Sort | isFFunc v} @-}
 type FuncSort = (SmtSort, SmtSort)
 
--- | Generating SMT expressions is a stateful process because new symbols ('apply', 'coerce',
---   'smt_lambda' and 'lam_arg') need to be emitted with unique ids for each newly encountered
---   function sort. The 'SymM' monad carries the 'SymEnv' state required to track the ids.
---   The state updates are performed in `L.F.Smt.Serialize` (functions `smt2App`, `smt2Coerc`,
---   `smt2Lam` and `smtLamArg`, correspondingly).
+{- | Generating SMT expressions is a stateful process because new symbols ('apply', 'coerce',
+  'smt_lambda' and 'lam_arg') need to be emitted with unique ids for each newly encountered
+  function sort. The 'SymM' monad carries the 'SymEnv' state required to track the ids.
+  The state updates are performed in `L.F.Smt.Serialize` (functions `smt2App`, `smt2Coerc`,
+  `smt2Lam` and `smtLamArg`, correspondingly).
+-}
 type SymM a = State SymEnv a
 
-instance NFData   SymEnv
+instance NFData SymEnv
 instance S.Store SymEnv
 
 instance Semigroup SymEnv where
-  e1 <> e2 = SymEnv { seSort     = seSort     e1 <> seSort     e2
-                    , seTheory   = seTheory   e1 <> seTheory   e2
-                    , seData     = seData     e1 <> seData     e2
-                    , seLits     = seLits     e1 <> seLits     e2
-                    , seAppls    = zipWith (<>) (seAppls e1) (seAppls e2)
-                    , seApplsCur = seApplsCur e1 <> seApplsCur e2
-                    , seIx       = seIx       e1 `max` seIx    e2
-                    , seString   = seString e1 && seString e2
-                    }
+    e1 <> e2 =
+        SymEnv
+            { seSort = seSort e1 <> seSort e2
+            , seTheory = seTheory e1 <> seTheory e2
+            , seData = seData e1 <> seData e2
+            , seLits = seLits e1 <> seLits e2
+            , seAppls = zipWith (<>) (seAppls e1) (seAppls e2)
+            , seApplsCur = seApplsCur e1 <> seApplsCur e2
+            , seInstances = mergeInstanceScopes (seInstances e1) (seInstances e2)
+            , seInstancesCur = mergeInstanceMaps (seInstancesCur e1) (seInstancesCur e2)
+            , seIx = seIx e1 `max` seIx e2
+            , seString = seString e1 && seString e2
+            , seSetBag = seSetBag e1 || seSetBag e2
+            }
 
 instance Monoid SymEnv where
-  mempty        = SymEnv emptySEnv emptySEnv emptySEnv emptySEnv [] mempty 0 True
-  mappend       = (<>)
+    mempty = SymEnv emptySEnv emptySEnv emptySEnv emptySEnv [] mempty [] mempty 0 True False
+    mappend = (<>)
+
+-- A live name has already been emitted to SMT. Neither a conflicting key nor
+-- two distinct keys sharing a wire name can be repaired by a later rename.
+mergeInstanceMaps :: M.HashMap (Symbol, Sort) Symbol -> M.HashMap (Symbol, Sort) Symbol -> M.HashMap (Symbol, Sort) Symbol
+mergeInstanceMaps left right
+    | all compatible (M.toList right)
+    , length (L.nub (M.elems combined)) == M.size combined = combined
+    | otherwise = Misc.errorstar "SMTLIB2: incompatible polymorphic value instance registries"
+  where
+    combined = M.union left right
+    compatible (key, value) = maybe True (== value) (M.lookup key left)
+
+mergeInstanceScopes :: [M.HashMap (Symbol, Sort) Symbol] -> [M.HashMap (Symbol, Sort) Symbol] -> [M.HashMap (Symbol, Sort) Symbol]
+mergeInstanceScopes [] right = right
+mergeInstanceScopes left [] = left
+mergeInstanceScopes (left : restLeft) (right : restRight) =
+    mergeInstanceMaps left right : mergeInstanceScopes restLeft restRight
 
 symEnv :: Config -> SEnv Sort -> SEnv TheorySymbol -> [DataDecl] -> SEnv Sort -> [Sort] -> SymEnv
-symEnv cfg xEnv fEnv ds ls _ = SymEnv xEnv' fEnv dEnv ls [] mempty 0 seStr
+symEnv cfg xEnv fEnv ds ls _ = SymEnv xEnv' fEnv dEnv ls [] mempty [] mempty 0 seStr (elabSetBag (solverFlags cfg))
   where
-    xEnv'   = unionSEnv xEnv wiredInEnv
-    dEnv    = fromListSEnv [(symbol d, d) | d <- ds]
-    seStr   = not (noStringTheory cfg)
+    xEnv' = unionSEnv xEnv wiredInEnv
+    dEnv = fromListSEnv [(symbol d, d) | d <- ds]
+    seStr = not (noStringTheory cfg)
 
 -- | These are "BUILT-in" polymorphic functions which are
 --   UNINTERPRETED but POLYMORPHIC, hence need to go through
@@ -187,6 +226,39 @@ symEnvTheory x env = lookupSEnv x (seTheory env)
 
 symEnvSort :: Symbol -> SymEnv -> Maybe Sort
 symEnvSort   x env = lookupSEnv x (seSort env)
+
+-- A free nullary polymorphic value has one value per selected logical sort.
+-- Callable schemes and interpreted theory constructors have other encodings.
+polyValueSort :: SymEnv -> Symbol -> Maybe Sort
+polyValueSort env x = do
+  scheme <- symEnvSort x env
+  guard (isPolyValueSort scheme)
+  guard $ case symEnvTheory x env of
+    Nothing -> True
+    Just theory -> tsInterp theory == Uninterp
+  pure scheme
+
+isPolyValueSort :: Sort -> Bool
+isPolyValueSort scheme = not (null variables) && case body of
+  FFunc {} -> False
+  FApp (FApp constructor _) _ | constructor == funcSort -> False
+  _ -> True
+  where
+    (variables, body) = bkAbs scheme
+
+-- This key preserves logical function structure even where SMT represents
+-- both functions and ordinary objects as Int. Floating variables follow the
+-- existing Int-erasure convention; tycons retain their native carrier metadata
+-- while their existing nominal equality ignores source locations.
+normalizeValueInstance :: Sort -> Maybe Sort
+normalizeValueInstance = go
+  where
+    go FAbs{} = Nothing
+    go FVar{} = Just FInt
+    go FObj{} = Just FInt
+    go (FFunc argument result) = go (FApp (FApp funcSort argument) result)
+    go (FApp constructor argument) = FApp <$> go constructor <*> go argument
+    go sort = Just sort
 
 insertSymEnv :: Symbol -> Sort -> SymEnv -> SymEnv
 insertSymEnv x t env = env { seSort = insertSEnv x t (seSort env) }
@@ -227,21 +299,23 @@ funcSortIndex fs =
               pure i
 
 ffuncSort :: SymEnv -> Sort -> FuncSort
-ffuncSort env t      = {- tracepp ("ffuncSort " ++ showpp (t1,t2)) -} (tx t1, tx t2)
+ffuncSort env t = {- tracepp ("ffuncSort " ++ showpp (t1,t2)) -} (tx t1, tx t2)
   where
-    tx               = applySmtSort (seData env)
-    (t1, t2)         = args t
+    tx = applySmtSort env
+    (t1, t2) = args t
     args (FFunc a b) = (a, b)
-    args _           = (FInt, FInt)
+    args _ = (FInt, FInt)
 
-applySmtSort :: SEnv DataDecl -> Sort -> SmtSort
+applySmtSort :: SymEnv -> Sort -> SmtSort
 applySmtSort = sortSmtSort False
 
-isIntSmtSort :: SEnv DataDecl -> Sort -> Bool
+isIntSmtSort :: SymEnv -> Sort -> Bool
 isIntSmtSort env s = SInt == applySmtSort env s
 
 --------------------------------------------------------------------------------
+
 -- | 'TheorySymbol' represents the information about each interpreted 'Symbol'
+
 --------------------------------------------------------------------------------
 data TheorySymbol  = Thy
   { tsSym    :: !Symbol          -- ^ name
@@ -314,52 +388,84 @@ instance S.Store SmtSort
 --   using `Int` (though really, there SHOULD BE NO floating tyVars...
 --   'smtSort True  msg t' serializes a sort 't' using type variables,
 --   'smtSort False msg t' serializes a sort 't' using 'Int' instead of tyvars.
-sortSmtSort :: Bool -> SEnv DataDecl -> Sort -> SmtSort
-sortSmtSort poly env t = sortSmtSort' poly env m t
+sortSmtSort :: Bool -> SymEnv -> Sort -> SmtSort
+sortSmtSort poly env t = sortSmtSortUsing variable poly env t
   where
     m = sortAbs t
+    variable i
+        | poly, i < m = SVar i
+        | otherwise = SInt
 
-sortSmtSort' :: Bool -> SEnv DataDecl -> Int -> Sort -> SmtSort
-sortSmtSort' poly env m t = go . unAbs $ t
-  where
-    go (FFunc _ _)    = SInt
-    go FInt           = SInt
-    go FReal          = SReal
-    go t
-      | t == boolSort = SBool
-      | isString t    = SString
-    go (FVar i)
-      | poly, i < m   = SVar i
-      | otherwise     = SInt
-    go t
-      | (ct:ts) <- unFApp t = fappSmtSort poly m env ct ts
-      | otherwise = error "Unexpected empty 'unFApp t'"
+-- Preserve selected variable origins while using the same native value
+-- translation, including erased arguments and datatype parameter padding.
+sortSmtSortWithVars :: (Int -> SmtSort) -> SymEnv -> Sort -> SmtSort
+sortSmtSortWithVars variable = sortSmtSortUsing variable False
 
-fappSmtSort :: Bool -> Int -> SEnv DataDecl -> Sort -> [Sort] -> SmtSort
-fappSmtSort poly m env = go
+sortSmtSortUsing :: (Int -> SmtSort) -> Bool -> SymEnv -> Sort -> SmtSort
+sortSmtSortUsing variable poly env t = go . resolveNumericKind (`lookupSEnv` seSort env) . unAbs $ t
   where
-    -- See https://github.com/ucsd-progsys/liquid-fixpoint/pull/839 for why
-    -- @FAbs m@ is re-added.
+    go (FFunc _ _) = SInt
+    go FInt = SInt
+    go FReal = SReal
+    go t
+        | t == boolSort = SBool
+        | isString t = SString
+    go (FVar i) = variable i
+    go t
+        | (ct : ts) <- unFApp t = fappSmtSort variable poly env ct ts
+        | otherwise = error "Unexpected empty 'unFApp t'"
+
+-- Explicit numeric-kind declarations fix an abstract scalar's representation.
+-- This is not inferred from a nominal constructor's Num/Fractional metadata.
+resolveNumericKind :: (Symbol -> Maybe Sort) -> Sort -> Sort
+resolveNumericKind lookupKind sort@(FObj name) = case lookupKind name of
+    Just FFrac -> FReal
+    Just FReal -> FReal
+    Just FNum -> FInt
+    Just FInt -> FInt
+    _ -> sort
+resolveNumericKind _ sort = sort
+
+-- Capture aliases while their declaration scope is still available. The
+-- resulting sort keeps its meaning when carried beneath a shadowing binder
+-- or out to a deferred declaration.
+resolveNumericSort :: (Symbol -> Maybe Sort) -> Sort -> Sort
+resolveNumericSort lookupKind = go
+  where
+    go (FFunc domain result) = FFunc (go domain) (go result)
+    go (FApp function argument) = FApp (go function) (go argument)
+    go (FAbs binder body) = FAbs binder (go body)
+    go sort = resolveNumericKind lookupKind sort
+
+fappSmtSort :: (Int -> SmtSort) -> Bool -> SymEnv -> Sort -> [Sort] -> SmtSort
+fappSmtSort variable poly env = go
+  where
+    -- Argument translation retains the enclosing variable interpretation.
     go (FTC c) [a]
-      | setConName == symbol c   = SSet (sortSmtSort' poly env m a)
+        | setConName == symbol c =
+            if seSetBag env then SArray (sortSmtSortUsing variable poly env a) SBool else SSet (sortSmtSortUsing variable poly env a)
     go (FTC c) [a]
-      | bagConName == symbol c   = SBag (sortSmtSort' poly env m a)
+        | bagConName == symbol c =
+            if seSetBag env then SArray (sortSmtSortUsing variable poly env a) SInt else SBag (sortSmtSortUsing variable poly env a)
     go (FTC c) [FNatNum n]
-      | ffldConName == symbol c  = SFFld n
+        | ffldConName == symbol c = SFFld n
     go (FTC c) [a, b]
-      | arrayConName == symbol c = SArray (sortSmtSort' poly env m a) (sortSmtSort' poly env m b)
+        | arrayConName == symbol c || mapConName == symbol c = SArray (sortSmtSortUsing variable poly env a) (sortSmtSortUsing variable poly env b)
     go (FTC bv) [FTC s]
-      | bitVecName == symbol bv
-      , Just n <- sizeBv s      = SBitVec n
+        | bitVecName == symbol bv
+        , Just n <- sizeBv s =
+            SBitVec n
     go s []
-      | isString s              = SString
+        | isString s = SString
     go (FTC c) ts
-      | Just n <- tyArgs c env
-      , let i = n - length ts   = SData c ((sortSmtSort' poly env m <$> ts) ++ pad i)
-    go _ _                      = SInt
+        | Just n <- tyArgs c (seData env)
+        , let i = n - length ts =
+            SData c ((sortSmtSortUsing variable poly env <$> ts) ++ pad i)
+    go _ _ = SInt
 
-    pad i | poly                = []
-          | otherwise           = replicate i SInt
+    pad i
+        | poly = []
+        | otherwise = replicate i SInt
 
 tyArgs :: (Symbolic x) => x -> SEnv DataDecl -> Maybe Int
 tyArgs x env = ddVars <$> lookupSEnv (symbol x) env
@@ -380,25 +486,3 @@ instance PPrint SmtSort where
 
 ppParens :: (PPrint d) => Tidy -> Doc -> [d] -> Doc
 ppParens k d ds = parens $ Misc.intersperse (text "") (d : (pprintTidy k <$> ds))
-
---------------------------------------------------------------------------------
--- | Coercing sorts inside environments for SMT theory encoding
---------------------------------------------------------------------------------
-
-coerceSortEnv :: ElabFlags -> SEnv Sort -> SEnv Sort
-coerceSortEnv ef ss = coerceSort ef <$> ss
-
-coerceSort :: ElabFlags -> Sort -> Sort
-coerceSort ef = (if elabSetBag ef then coerceSetBagToArray else id) . coerceMapToArray
-
-coerceEnv :: ElabFlags -> SymEnv -> SymEnv
-coerceEnv slv env =
-  SymEnv { seSort     = coerceSortEnv slv (seSort env)
-         , seTheory   = seTheory env
-         , seData     = seData   env
-         , seLits     = seLits   env
-         , seAppls    = seAppls  env
-         , seApplsCur = seApplsCur env
-         , seIx       = seIx     env
-         , seString   = seString env
-         }

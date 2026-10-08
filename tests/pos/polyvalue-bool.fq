@@ -1,0 +1,8 @@
+// Preserve the supported Bool instance from the exact undef00 boundary fixture.
+bind 1 undef1 : {v: func(1, [@(0)]) | []}
+
+constraint:
+  env [1]
+  lhs {v : bool | [v = undef1]}
+  rhs {v : bool | [0 < 7]}
+  id 1 tag []

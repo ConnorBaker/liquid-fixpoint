@@ -14,4 +14,3 @@ constraint:
   lhs {v : bool | [v = undef2]}
   rhs {v : bool | [0 < 7]}
   id 2 tag []
-

@@ -1,0 +1,8 @@
+// The unused declaration must not hide an ordinary failed obligation.
+constant unused : func(2, [@(1)])
+bind 0 input : {v : int | []}
+constraint:
+  env [0]
+  lhs {v : int | v = input + 1}
+  rhs {v : int | v = input}
+  id 0 tag []

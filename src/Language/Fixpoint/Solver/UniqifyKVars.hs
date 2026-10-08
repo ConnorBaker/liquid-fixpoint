@@ -1,5 +1,4 @@
 {-# LANGUAGE CPP                    #-}
-{-# LANGUAGE ViewPatterns           #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 
 {- | This module creates new bindings for each argument of each kvar.
@@ -35,70 +34,99 @@ wf:
 
 -}
 
-module Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify) where
+module Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify, FormalOrigin (..), WfOrigins, occupiedSymbols) where
 
 import           Language.Fixpoint.Types
 import           Language.Fixpoint.Types.Visitor (mapKVarSubsts)
+import qualified Language.Fixpoint.Smt.Theories as Thy
 import qualified Data.HashMap.Strict as M
+import qualified Data.HashSet as S
 import qualified Data.List as L
 #if !MIN_VERSION_base(4,20,0)
 import           Data.Foldable       (foldl')
 #endif
 
 --------------------------------------------------------------------------------
-wfcUniqify    :: SInfo a -> SInfo a
-wfcUniqify fi = updateWfcs $ remakeSubsts fi
+wfcUniqify :: SInfo a -> (WfOrigins, SInfo a)
+wfcUniqify fi = updateWfcs names $ remakeSubsts names fi
+  where
+    names = formalNames fi
 
+-- Every generated formal must be outside the source declaration namespace,
+-- including the names of other KVar formals already allocated in this query.
+occupiedSymbols :: SInfo a -> S.HashSet Symbol
+occupiedSymbols fi = S.fromList $ binders ++ values ++ globals ++ map fst (toListSEnv declared)
+  where
+    binders = [sym | (_, (sym, _, _)) <- bindEnvToList (bs fi)]
+    values = [v | w <- M.elems (ws fi), let (v, _, _) = wrft w]
+    globals = map fst (toListSEnv (gLits fi) ++ toListSEnv (dLits fi))
+    declared = Thy.theorySymbols (ddecls fi) <> Thy.theorySymbols (defns fi) <> Thy.theorySymbols (aenvEqs (ae fi))
 
+type FormalNames = M.HashMap KVar (M.HashMap Symbol Symbol)
+
+data FormalOrigin = ValueOrigin !Symbol !BindId | BindOrigin !Symbol !BindId
+  deriving (Eq, Show)
+
+type WfOrigins = M.HashMap KVar [FormalOrigin]
+
+formalNames :: SInfo a -> FormalNames
+formalNames fi = snd $ L.foldl' allocateKVar (occupiedSymbols fi, M.empty) (L.sort $ M.keys $ ws fi)
+  where
+    allocateKVar (used, allNames) k = (used', M.insert k names allNames)
+      where
+        (used', names) = L.foldl' (allocate k) (used, M.empty) (L.sort $ kvarDomain fi k)
+    allocate k (used, names) source
+        | M.member source names = (used, names)
+        | otherwise =
+            let (used', target) = freshInNS (kArgSymbol source (kv k)) used
+             in (used', M.insert source target names)
+
+formalName :: FormalNames -> KVar -> Symbol -> Symbol
+formalName names k source = M.lookupDefault (kArgSymbol source (kv k)) source (M.lookupDefault M.empty k names)
 
 -- mapKVarSubsts (\k su -> restrict table k su xs)
 --------------------------------------------------------------------------------
-remakeSubsts :: SInfo a -> SInfo a
+remakeSubsts :: FormalNames -> SInfo a -> SInfo a
 --------------------------------------------------------------------------------
-remakeSubsts fi = mapKVarSubsts (remakeSubst fi) fi
+remakeSubsts names fi = mapKVarSubsts (remakeSubst names fi) fi
 
-remakeSubst :: SInfo a -> KVar -> KVarSubst Symbol Symbol -> KVarSubst Symbol Symbol
-remakeSubst fi k su = foldl' (updateSubst k) su (kvarDomain fi k)
-
-updateSubst :: KVar -> KVarSubst Symbol Symbol -> Symbol -> KVarSubst Symbol Symbol
-updateSubst k (fromKVarSubst -> su) sym
-  = case M.lookup sym su of
-      Just z  -> toKVarSubst $ M.delete sym $ M.insert ksym z          su
-      Nothing -> toKVarSubst $                M.insert ksym (eVar sym) su
-    where
-      kx      = kv k
-      ksym    = kArgSymbol sym kx
-
--- / | sym `M.member` su = Su $ M.delete sym $ M.insert ksym (su M.! sym) su
--- /  | otherwise         = Su $                M.insert ksym (eVar sym)   su
+remakeSubst :: FormalNames -> SInfo a -> KVar -> KVarSubst Symbol Symbol -> KVarSubst Symbol Symbol
+remakeSubst names fi k su = toKVarSubst $ M.union translated untouched
+  where
+    actuals = fromKVarSubst su
+    domain = kvarDomain fi k
+    oldNames = S.fromList domain
+    translated = M.fromList [(formalName names k source, M.lookupDefault (eVar source) source actuals) | source <- domain]
+    untouched = M.filterWithKey (\source _ -> not (S.member source oldNames)) actuals
 
 --------------------------------------------------------------------------------
-updateWfcs :: SInfo a -> SInfo a
+updateWfcs :: FormalNames -> SInfo a -> (WfOrigins, SInfo a)
 --------------------------------------------------------------------------------
-updateWfcs fi = M.foldl' updateWfc fi (ws fi)
+updateWfcs names fi = L.foldl' (\state (k, w) -> updateWfc names state k w) (M.empty, fi) (L.sortOn fst $ M.toList $ ws fi)
 
-updateWfc :: SInfo a -> WfC a -> SInfo a
-updateWfc fi w    = fi'' { ws = M.insert k w' (ws fi) }
+updateWfc :: FormalNames -> (WfOrigins, SInfo a) -> KVar -> WfC a -> (WfOrigins, SInfo a)
+updateWfc names (origins, fi) k w = (M.insert k (ValueOrigin v valueId : reverse binderOrigins) origins, fi''{ws = M.insert k w' (ws fi)})
   where
-    w'           = w { wenv = insertsIBindEnv newIds mempty, wrft = (v', t, k) }
-    (_, fi'')     = newTopBind v' (trueSortedReft t) a fi'
-    (fi', newIds) = foldl' (accumBindsIfValid k a) (fi, []) (L.sort $ elemsIBindEnv $ wenv w)
-    (v, t, k)     = wrft w
-    v'            = kArgSymbol v (kv k)
-    a             = winfo w
+    w' = w{wenv = insertsIBindEnv newIds mempty, wrft = (v', t, k)}
+    (valueId, fi'') = newTopBind v' (trueSortedReft t) a fi'
+    (fi', newIds, binderOrigins) = foldl' (accumBindsIfValid names k a) (fi, [], []) (L.sort $ elemsIBindEnv $ wenv w)
+    (v, t, k) = wrft w
+    v' = formalName names k v
+    a = winfo w
 
-accumBindsIfValid :: KVar -> a -> (SInfo a, [BindId]) -> BindId -> (SInfo a, [BindId])
-accumBindsIfValid k a (fi, ids) i = if renamable then accumBinds k a (fi, ids) i else (fi, i : ids)
+accumBindsIfValid :: FormalNames -> KVar -> a -> (SInfo a, [BindId], [FormalOrigin]) -> BindId -> (SInfo a, [BindId], [FormalOrigin])
+accumBindsIfValid names k a (fi, ids, origins) i =
+    if renamable then accumBinds names k a (fi, ids, origins) i else (fi, i : ids, BindOrigin oldSym i : origins)
   where
-    (_, sr, _)                    = lookupBindEnv i      (bs fi)
-    renamable                   = isValidInRefinements (sr_sort sr)
+    (oldSym, sr, _) = lookupBindEnv i (bs fi)
+    renamable = isValidInRefinements (sr_sort sr)
 
-accumBinds :: KVar -> a -> (SInfo a, [BindId]) -> BindId -> (SInfo a, [BindId])
-accumBinds k a (fi, ids) i = (fi', i' : ids)
+accumBinds :: FormalNames -> KVar -> a -> (SInfo a, [BindId], [FormalOrigin]) -> BindId -> (SInfo a, [BindId], [FormalOrigin])
+accumBinds names k a (fi, ids, origins) i = (fi', i' : ids, BindOrigin oldSym i' : origins)
   where
-    (oldSym, sr,_) = lookupBindEnv i (bs fi)
-    newSym       = {- tracepp "kArgSymbol" $ -}  kArgSymbol oldSym (kv k)
-    (i', fi')    = newTopBind newSym sr a fi
+    (oldSym, sr, _) = lookupBindEnv i (bs fi)
+    newSym = formalName names k oldSym
+    (i', fi') = newTopBind newSym sr a fi
 
 -- | `newTopBind` ignores the actual refinements as they are not relevant
 --   in the kvar parameters (as suggested by BLC.)

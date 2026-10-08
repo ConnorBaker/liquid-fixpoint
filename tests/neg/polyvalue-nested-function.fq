@@ -1,0 +1,10 @@
+// A nested function and Int have the same SMT array representation, not identity.
+constant firstFamily : func(1, [Set_Set @(0)])
+constant secondFamily : func(1, [Set_Set @(0)])
+bind 0 coincidence : {v : Set_Set int | v = firstFamily && v = secondFamily}
+
+constraint:
+  env [0]
+  lhs {v : Set_Set (func(0, [int; int])) | v = firstFamily}
+  rhs {v : Set_Set (func(0, [int; int])) | v = secondFamily}
+  id 0 tag []

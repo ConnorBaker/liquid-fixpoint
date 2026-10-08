@@ -64,8 +64,8 @@ module Language.Fixpoint.Smt.Interface (
 
     ) where
 
-import           Language.Fixpoint.Types.Config ( SMTSolver (..), solverFlags
-                                                , Config (solver, smtTimeout, noStringTheory, save, saveDir, allowHO))
+import           Language.Fixpoint.Types.Config ( SMTSolver (..), solverFlags, elabSetBag
+                                                , Config (solver, smtTimeout, smtMbqi, noStringTheory, save, saveDir, allowHO))
 import qualified Language.Fixpoint.Misc          as Misc
 import           Language.Fixpoint.Types.Errors
 import           Language.Fixpoint.Utils.Files
@@ -73,7 +73,7 @@ import           Language.Fixpoint.Types         hiding (allowHO)
 import qualified Language.Fixpoint.Types         as F
 import           Language.Fixpoint.Smt.Types
 import qualified Language.Fixpoint.Smt.Theories as Thy
-import           Language.Fixpoint.Smt.Serialize ()
+import           Language.Fixpoint.Smt.Serialize (nativeFunctionAxioms)
 import           Control.Applicative      ((<|>))
 import           Control.Monad
 import           Control.Monad.State
@@ -123,21 +123,25 @@ runCommands cmds
        return zs
 -}
 
-checkValidWithContext
-  :: HasCallStack => [(Symbol, Sort)] -> Expr -> Expr -> SmtM Bool
+checkValidWithContext ::
+    (HasCallStack) => [(Symbol, Sort)] -> Expr -> Expr -> SmtM Bool
 checkValidWithContext xts p q =
-  smtBracket "checkValidWithContext" $
-    checkValid' xts p q
+    smtBracket "checkValidWithContext" $
+        checkValid' xts p q
 
--- | type ClosedPred E = {v:Pred | subset (vars v) (keys E) }
--- checkValid :: e:Env -> ClosedPred e -> ClosedPred e -> IO Bool
-checkValid
-  :: HasCallStack
-  => Config -> FilePath -> [(Symbol, Sort)] -> Expr -> Expr -> IO Bool
+{- | type ClosedPred E = {v:Pred | subset (vars v) (keys E) }
+checkValid :: e:Env -> ClosedPred e -> ClosedPred e -> IO Bool
+-}
+checkValid ::
+    (HasCallStack) =>
+    Config -> FilePath -> [(Symbol, Sort)] -> Expr -> Expr -> IO Bool
 checkValid cfg f xts p q = do
-  me <- makeContext cfg f
-  evalStateT (checkValid' xts p q) me
+    (environment, [p', q']) <- validateSourceQuery cfg xts [p, q]
+    bracket (makeContext cfg f) cleanupContext $ \me ->
+        evalStateT (checkValid' xts p' q') me{ctxSymEnv = environment}
 
+-- | Contextual queries consume already checked SMT expressions. Their caller
+-- owns the live declarations and any preceding source elaboration.
 checkValid' :: HasCallStack => [(Symbol, Sort)] -> Expr -> Expr -> SmtM Bool
 checkValid' xts p q = do
   smtDecls xts
@@ -150,15 +154,32 @@ checkValid' xts p q = do
 -- checkValid :: e:Env -> [ClosedPred e] -> IO [Bool]
 checkValids :: Config -> FilePath -> [(Symbol, Sort)] -> [Expr] -> IO [Bool]
 checkValids cfg f xts ps = do
-  me <- makeContext cfg f
-  evalStateT (checkValids' xts ps) me
+    (environment, ps') <- validateSourceQuery cfg xts ps
+    bracket (makeContext cfg f) cleanupContext $ \me ->
+        evalStateT (checkValids' xts ps') me{ctxSymEnv = environment}
+
+{- | Standalone validity queries own a complete source typing environment.
+Check the original predicates together before Boolean simplification or
+solver creation, then serialize that same judgment's typed numeric operators
+and annotations. This does not run defunctionalization on source queries.
+-}
+validateSourceQuery :: Config -> [(Symbol, Sort)] -> [Expr] -> IO (SymEnv, [Expr])
+validateSourceQuery cfg xts predicates = do
+    PAnd elaborated <- evaluate $ elabExpr parameter (Just boolSort) (PAnd predicates)
+    pure (environment, elaborated)
+  where
+    parameter = ElabParam (solverFlags cfg) "SMT validity query" environment
+    -- The source judgment and serializer share the solver's native catalog.
+    -- An explicitly declared ordinary symbol shadows its native namesake.
+    native = foldr deleteSEnv (Thy.theorySymbols (solver cfg)) (map fst xts)
+    environment = symEnv cfg (fromListSEnv xts <> fmap tsSort native) native [] mempty []
 
 checkValids' :: [(Symbol, Sort)] -> [Expr] -> SmtM [Bool]
 checkValids' xts ps = do
-  smtDecls xts
-  forM ps $ \p ->
-     smtBracket "checkValids" $
-       smtAssert (PNot p) >> smtCheckUnsat
+    smtDecls xts
+    forM ps $ \p ->
+        smtBracket "checkValids" $
+            smtAssert (PNot p) >> smtCheckUnsat
 
 -- debugFile :: FilePath
 -- debugFile = "DEBUG.smt2"
@@ -185,34 +206,89 @@ commandRaw ctxLog ctxSolver ctxVerbose cmdBS = do
 
 --------------------------------------------------------------------------------
 {-# SCC command #-}
-command  :: HasCallStack => Command -> SmtM Response
+command :: (HasCallStack) => Command -> SmtM Response
 --------------------------------------------------------------------------------
-command !cmd       = do
-  -- whenLoud $ do LTIO.appendFile debugFile (s <> "\n")
-  --               LTIO.putStrLn ("CMD-RAW:" <> s <> ":CMD-RAW:DONE")
-  ctxLog <- gets ctxLog
-  ctxSolver <- gets ctxSolver
-  ctxVerbose <- gets ctxVerbose
-  cmdBS <- liftSym $ runSmt2 cmd
-  forM_ ctxLog $ \h -> lift $ do
-    BS.hPutBuilder h cmdBS
-    LBS.hPutStr h "\n"
-  lift $ case cmd of
-    CheckSat   -> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
-    GetValue _ -> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
-    _          -> SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
+command (CMany commands) = mapM_ command commands >> pure Ok
+command !cmd = do
+    -- whenLoud $ do LTIO.appendFile debugFile (s <> "\n")
+    --               LTIO.putStrLn ("CMD-RAW:" <> s <> ":CMD-RAW:DONE")
+    ctxLog <- gets ctxLog
+    ctxSolver <- gets ctxSolver
+    ctxVerbose <- gets ctxVerbose
+    cmdBody <- liftSym $ runSmt2 cmd
+    nativeAxioms <- liftSym nativeFunctionAxioms
+    context <- get
+    let environment = ctxSymEnv context
+        declarations =
+            [Declare name inputs result | (name, (inputs, result)) <- funcSortVars (ctxLams context) environment]
+                ++ [Declare (symbolSmtText name) [] (sortSmtSort False environment sort) | ((_, sort), name) <- M.toList (seInstancesCur environment)]
+    declarationBytes <- liftSym $ mapM runSmt2 declarations
+    let cmdBS = mconcat [bytes <> "\n" | bytes <- declarationBytes ++ nativeAxioms] <> cmdBody
+        commit [] nursery = [nursery]
+        commit (scope : rest) nursery = (scope <> nursery) : rest
+    modify $ \current ->
+        current
+            { ctxSymEnv =
+                (ctxSymEnv current)
+                    { seAppls = mergeTopAppls (seApplsCur environment) (seAppls environment)
+                    , seApplsCur = M.empty
+                    , seInstances = commit (seInstances environment) (seInstancesCur environment)
+                    , seInstancesCur = M.empty
+                    }
+            }
+    requested <- case cmd of
+        GetValue names -> forM names $ \name -> do
+            wire <- liftSym $ runSmt2 name
+            pure (symbol (TE.decodeUtf8 (LBS.toStrict (BS.toLazyByteString wire))), name)
+        _ -> pure []
+    forM_ ctxLog $ \h -> lift $ do
+        BS.hPutBuilder h cmdBS
+        LBS.hPutStr h "\n"
+    response <- lift $ case cmd of
+        CheckSat -> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
+        GetValue _ -> restoreValueNames requested <$> commandRaw ctxLog ctxSolver ctxVerbose cmdBS
+        _ -> SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
+    case cmd of
+        Push -> modify $ \current ->
+            let env = ctxSymEnv current
+             in current
+                    { ctxSymEnv =
+                        env
+                            { seInstances = M.empty : seInstances env
+                            , seAppls = pushAppls (seAppls env)
+                            }
+                    , ctxIxs = seIx env : ctxIxs current
+                    }
+        Pop -> modify $ \current ->
+            let env = ctxSymEnv current
+                (index, rest) = fromMaybe (0, []) (uncons (ctxIxs current))
+             in current
+                    { ctxSymEnv =
+                        env
+                            { seInstances = drop 1 (seInstances env)
+                            , seAppls = popAppls (seAppls env)
+                            , seIx = index
+                            }
+                    , ctxIxs = rest
+                    }
+        _ -> pure ()
+    pure response
 
--- | A variant of `command` that accepts a pre-built command
-commandB :: Builder -> SmtM Response
---------------------------------------------------------------------------------
-commandB cmdBS       = do
-  ctxLog <- gets ctxLog
-  ctxSolver <- gets ctxSolver
-  forM_ ctxLog $ \h -> lift $ do
-    BS.hPutBuilder h cmdBS
-    LBS.hPutStr h "\n"
-  lift $ SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
+-- Correlate this reply with this request, including aliases and repetitions.
+-- Never interpret a wire prefix independently of the names actually queried.
+restoreValueNames :: [(Symbol, Symbol)] -> Response -> Response
+restoreValueNames requested (Values values) = either Misc.errorstar Values (restore requested values)
+  where
+    restore [] [] = Right []
+    restore _ [] = Left "SMT get-value omitted requested identifiers"
+    restore names ((wire, value) : rest) =
+        case break ((== wire) . fst) names of
+            (before, (_, name) : after) -> ((name, value) :) <$> restore (before ++ after) rest
+            _ -> Left ("SMT get-value returned an unrequested identifier: " ++ show wire)
+restoreValueNames _ response@Error{} = response
+restoreValueNames _ response = Misc.errorstar ("Unexpected SMT get-value response: " ++ show response)
 
+-- | Enable Z3's dynamic MBQI option. Other solvers use startup configuration.
 smtSetMbqi :: SmtM ()
 smtSetMbqi = interact' SetMbqi
 
@@ -223,6 +299,7 @@ responseP = {- SCC "responseP" -} A.char '(' *> sexpP
          <|> A.string "sat"     *> return Sat
          <|> A.string "unsat"   *> return Unsat
          <|> A.string "unknown" *> return Unknown
+         <|> A.string "unsupported" *> return (Error "unsupported")
 
 sexpP :: SmtParser Response
 sexpP = {- SCC "sexpP" -} A.string "error" *> (Error <$> errorP)
@@ -232,7 +309,7 @@ errorP :: SmtParser T.Text
 errorP = A.skipSpace *> A.char '"' *> A.takeWhile1 (/='"') <* A.string "\")"
 
 valuesP :: SmtParser [(Symbol, T.Text)]
-valuesP = A.many1' pairP <* A.char ')'
+valuesP = A.many1' pairP <* A.skipSpace <* A.char ')'
 
 pairP :: SmtParser (Symbol, T.Text)
 pairP = {- SCC "pairP" -}
@@ -241,20 +318,34 @@ pairP = {- SCC "pairP" -}
      !x <- symbolP
      A.skipSpace
      !v <- valueP
+     A.skipSpace
      _ <- A.char ')'
      return (x,v)
 
 symbolP :: SmtParser Symbol
-symbolP = {- SCC "symbolP" -} symbol <$> A.takeWhile1 (not . isSpace)
+symbolP = {- SCC "symbolP" -} symbol . fst <$> A.match (quotedSymbolP <|> atomP)
 
 valueP :: SmtParser T.Text
-valueP = {- SCC "valueP" -} negativeP
-      <|> A.takeWhile1 (\c -> not (c == ')' || isSpace c))
+valueP = {- SCC "valueP" -} fst <$> A.match termP
+  where
+    -- Model values are SMT terms, not necessarily literals, even for Bool.
+    -- Preserve their syntax; validity filtering interprets only literal false.
+    termP = listP <|> quotedSymbolP <|> stringP <|> atomP
+    listP = A.char '(' *> spacesP *> A.many' (termP <* spacesP) *> A.char ')' *> pure ()
+    stringP = A.char '"' *> rest
+      where
+        rest = do
+          _ <- A.takeTill (== '"')
+          _ <- A.char '"'
+          next <- A.peekChar
+          if next == Just '"' then A.anyChar *> rest else pure ()
+    spacesP = A.skipSpace *> A.many' (A.char ';' *> A.skipWhile (/= '\n') *> A.skipSpace) *> pure ()
 
-negativeP :: SmtParser T.Text
-negativeP
-  = do v <- A.char '(' *> A.takeWhile1 (/=')') <* A.char ')'
-       return $ "(" <> v <> ")"
+quotedSymbolP :: SmtParser ()
+quotedSymbolP = A.char '|' *> A.skipWhile (/= '|') *> A.char '|' *> pure ()
+
+atomP :: SmtParser ()
+atomP = A.takeWhile1 (\c -> not (isSpace c || c `elem` ("()\"|;" :: String))) *> pure ()
 
 --------------------------------------------------------------------------
 -- | SMT Context ---------------------------------------------------------
@@ -264,7 +355,8 @@ negativeP
 makeContext :: Config -> FilePath -> IO Context
 --------------------------------------------------------------------------
 makeContext cfg f
-  = do mb_hLog <- if not (save cfg) then pure Nothing else do
+  = do checkMbqiFlag cfg
+       mb_hLog <- if not (save cfg) then pure Nothing else do
            createDirectoryIfMissing True $ takeDirectory smtFile
            hLog <- openFile smtFile WriteMode
            hSetBuffering hLog $ BlockBuffering $ Just $ 1024 * 1024 * 64
@@ -282,12 +374,13 @@ makeContext cfg f
 
 makeContextWithSEnv :: Config -> FilePath -> SymEnv -> DefinedFuns -> IO Context
 makeContextWithSEnv cfg f env defns = do
-  ctx      <- makeContext cfg f
-  let ctx' = ctx {ctxSymEnv = env, ctxDefines = defns}
-  execStateT declare ctx'
+    ctx <- makeContext cfg f
+    let ctx' = ctx{ctxSymEnv = env{seSetBag = elabSetBag (solverFlags cfg)}, ctxDefines = defns}
+    execStateT declare ctx'
 
 makeContextNoLog :: Config -> IO Context
 makeContextNoLog cfg = do
+  checkMbqiFlag cfg
   me  <- makeContext' cfg Nothing
   pre <- smtPreamble cfg (solver cfg) me
   mapM_ (SMTLIB.Backends.command_ (ctxSolver me)) pre
@@ -340,7 +433,7 @@ makeContext' cfg ctxLog
                   , ctxClose     = closeIO
                   , ctxLog       = ctxLog
                   , ctxVerbose   = loud
-                  , ctxSymEnv    = mempty
+                  , ctxSymEnv    = symEnv cfg mempty mempty [] mempty []
                   , ctxIxs       = []
                   , ctxDefines   = mempty
                   -- This is a heurstic to avoid generating large sequences of unused `lam_arg` symbols
@@ -366,9 +459,19 @@ smtPreamble cfg s me
          checkValidStringFlag Z3 v cfg
          return $ makeMbqi ++ makeTimeout cfg ++ Thy.preamble cfg Z3
   | otherwise
-    = checkValidStringFlag s [] cfg >> return (Thy.preamble cfg s)
+    = checkValidStringFlag s [] cfg >> return (makeMbqi ++ Thy.preamble cfg s)
   where
-    makeMbqi = ["\n(set-option :smt.mbqi false)"]
+    makeMbqi
+      | s == Z3 || s == Z3mem = ["\n(set-option :smt.mbqi " <> (if smtMbqi cfg then "true" else "false") <> ")"]
+      | s == Cvc5 && smtMbqi cfg = ["(set-option :mbqi true)"]
+      | otherwise = []
+
+checkMbqiFlag :: Config -> IO ()
+checkMbqiFlag cfg =
+    when (smtMbqi cfg && solver cfg `notElem` [Z3, Z3mem, Cvc5]) $
+        die $
+            err dummySpan $
+                text ("--mbqi is not supported by " ++ show (solver cfg))
 
 getZ3Version :: Context -> IO [Int]
 getZ3Version me
@@ -412,14 +515,14 @@ smtDecls = mapM_ $ uncurry smtDecl
 
 smtDecl :: Symbol -> Sort -> SmtM ()
 smtDecl x t = do
-  me <- get
-  let env = seData (ctxSymEnv me)
-  let ins' = sortSmtSort False env <$> ins
-  let out' = sortSmtSort False env     out
-  interact' (notracepp _msg $ Declare (symbolSafeText x) ins' out')
+    me <- get
+    let env = ctxSymEnv me
+    let ins' = sortSmtSort False env <$> ins
+    let out' = sortSmtSort False env out
+    interact' (notracepp _msg $ Declare (symbolSmtText x) ins' out')
   where
     (ins, out) = deconSort t
-    _msg       = "smtDecl: " ++ showpp (x, t, ins, out)
+    _msg = "smtDecl: " ++ showpp (x, t, ins, out)
 
 smtFuncDecl :: T.Text -> ([SmtSort],  SmtSort) -> SmtM ()
 smtFuncDecl x (ts, t) = interact' (Declare x ts t)
@@ -438,27 +541,28 @@ smtAssert p = interact' (Assert Nothing p)
 -- the following three functions will emit additional `apply`,
 -- `coerce`, and `lambda` symbols for fresh function sorts as needed
 smtAssertDecl :: HasCallStack => Expr -> SmtM ()
-smtAssertDecl p = interactDecl' (Assert Nothing p)
+smtAssertDecl p = interact' (Assert Nothing p)
 
 smtDefineEqn :: Equation -> SmtM ()
 smtDefineEqn Equ {..} = smtDefineFunc eqName eqArgs eqSort eqBody
 
 smtDefineFunc :: Symbol -> [(Symbol, F.Sort)] -> F.Sort -> Expr -> SmtM ()
-smtDefineFunc name symList rsort e =
-  do env <- gets (seData . ctxSymEnv)
-     interactDecl' $
-        DefineFunc
-          name
-          (map (sortSmtSort False env <$>) symList)
-          (sortSmtSort False env rsort)
-          e
+smtDefineFunc name parameters result body =
+    do
+        env <- gets ctxSymEnv
+        interact' $
+            DefineFunc
+                name
+                (map (sortSmtSort False env <$>) parameters)
+                (sortSmtSort False env result)
+                body
 
 -----------------------------------------------------------------
 
--- | Uses `interactDecl'` so that any `apply`, `coerce` and `lambda` symbols
---   used by the axiom are declared before it is asserted.
+-- | The shared command path declares the axiom's discovered support before
+--   asserting it, just as it does for ordinary assertions and definitions.
 smtAssertAxiom :: HasCallStack => Triggered Expr -> SmtM ()
-smtAssertAxiom p  = interactDecl' (AssertAx p)
+smtAssertAxiom p  = interact' (AssertAx p)
 
 smtDistinct :: [Expr] -> SmtM ()
 smtDistinct az = interact' (Distinct az)
@@ -476,19 +580,9 @@ smtBracket :: String -> SmtM a -> SmtM a
 smtBracket msg a = do
   smtComment (T.pack $ "smtBracket - start: " ++ msg)
   smtPush
-  modify $ \ctx ->
-    let env = ctxSymEnv ctx in
-    ctx { ctxSymEnv = env { seAppls = pushAppls (seAppls env) }
-        , ctxIxs = seIx env : ctxIxs ctx}
   r <- a
   smtPop
   smtComment (T.pack $ "smtBracket - end: " ++ msg)
-  modify $ \ctx ->
-    let env = ctxSymEnv ctx
-        (i , is) = fromMaybe (0, []) (uncons $ ctxIxs ctx)
-      in
-    ctx { ctxSymEnv = env {seAppls = popAppls (seAppls env) , seIx = i}
-        , ctxIxs = is}
   return r
 
 respSat :: HasCallStack => Response -> Bool
@@ -499,18 +593,6 @@ respSat r       = die $ err dummySpan $ text ("crash: SMTLIB2 respSat = " ++ sho
 
 interact' :: Command -> SmtM ()
 interact' cmd  = void $ command cmd
-
--- | a variant of `interact'` which also emits fresh
---   `apply`, `coerce`, and `lambda` symbols
-interactDecl' :: HasCallStack => Command -> SmtM ()
-interactDecl' cmd  = do
-  cmdBS <- liftSym $ runSmt2 cmd
-  ctx <- get
-  let env = ctxSymEnv ctx
-  let ats = funcSortVars (ctxLams ctx) env
-  forM_ ats $ uncurry smtFuncDecl
-  put (ctx {ctxSymEnv = env {seAppls = mergeTopAppls (seApplsCur env) (seAppls env), seApplsCur = M.empty} })
-  void $ commandB cmdBS
 
 makeTimeout :: Config -> [Builder]
 makeTimeout cfg
@@ -528,15 +610,15 @@ declare = do
   let tx         = elaborate (ElabParam (ctxElabF me) "declare" env)
   let lts        = F.toListSEnv . F.seLits $ env
   let dss        = dataDeclarations          env
-  let thyXTs     =             [ (x, t) | (x, t) <- xts, symKind env x == Just F.Uninterp ]
-  let qryXTs     = fmap tx <$> [ (x, t) | (x, t) <- xts, symKind env x == Nothing ]
+  let qryXTs     = fmap tx <$> [ (x, t) | (x, t) <- xts, symKind env x `elem` [Nothing, Just F.Uninterp] ]
   -- let isKind n   = (n ==)  . symKind env . fst
   let MkDefinedFuns defs = ctxDefines me
   let ess        = distinctLiterals  lts
   let axs        = Thy.axiomLiterals (config me) lts
   forM_ dss              smtDataDecl
-  forM_ thyXTs $ uncurry smtDecl
-  forM_ qryXTs $ uncurry smtDecl
+  -- Ordinary functions are values used through apply, not native callables.
+  forM_ qryXTs $ \(x, t) ->
+    smtFuncDecl (symbolSmtText x) ([], sortSmtSort False env t)
   forM_ defs             smtDefineEqn
   forM_ ess              smtDistinct
   forM_ axs              smtAssert

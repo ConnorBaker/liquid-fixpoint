@@ -136,7 +136,7 @@ evalCandsLoop ie ictx0 γ env = go ictx0
   where
     withRewrites exprs =
       let
-        sortEnv = seSort (evEnv env)
+        sortEnv = evEnv env
         rws = [rewrite sortEnv e rw | rw <- snd <$> M.toList (knSims γ)
                             ,  e <- S.toList (snd `S.map` exprs)]
       in
@@ -163,7 +163,7 @@ evalOneCandStep env γ env' (ictx, acc) e = do
   res <- evalOne env γ env' ictx e
   return (ictx, res : acc)
 
-rewrite :: SEnv Sort -> Expr -> Rewrite -> [(Expr,Expr)]
+rewrite :: SymEnv -> Expr -> Rewrite -> [(Expr,Expr)]
 rewrite env e rw = filter (wellSorted env . fst) $ Mb.mapMaybe (`rewriteTop` rw) (notGuardedApps e)
 
 rewriteTop :: Expr -> Rewrite -> Maybe (Expr,Expr)
@@ -176,8 +176,8 @@ rewriteTop e rw
   = Nothing
 
 -- | Check that an expression is well-sorted
-wellSorted :: SEnv Sort -> Expr -> Bool
-wellSorted env = Mb.isJust . checkSortExpr dummySpan env
+wellSorted :: SymEnv -> Expr -> Bool
+wellSorted env = Mb.isJust . checkSortExpr (Just env) dummySpan (seSort env)
 
 ----------------------------------------------------------------------------------------------
 -- | Step 3: @resSInfo@ uses incremental PLE result @InstRes@ to produce the strengthened SInfo
@@ -269,7 +269,7 @@ updCtx InstEnv{..} ctx delta cidMb
   where
     initEqs   = S.fromList $ concat [rewrite sortEnv e rw | e  <- cands ++ (snd <$> S.toList (icEquals ctx))
                                                   , rw <- snd <$> M.toList (knSims ieKnowl)]
-    sortEnv   = seSort (evEnv ieEvEnv)
+    sortEnv   = evEnv ieEvEnv
     cands     = concatMap (makeCandidates ieKnowl ctx) (rhs:es)
     sims      = S.filter (isSimplification (knDCs ieKnowl)) (initEqs <> icEquals ctx)
     econsts   = M.fromList $ findConstants ieKnowl es
@@ -404,7 +404,7 @@ largestApps = flip go []
 
 fastEval :: ConstMap -> Knowledge -> ICtx -> Expr -> EvalST Expr
 fastEval ienv γ ctx e
-    = do env  <- gets (seSort . evEnv)
+    = do env  <- gets evEnv
          return $ mytracepp ("evaluating" ++ show e) $ interpret ienv γ ctx env $ simplify γ ctx e
 
 --------------------------------------------------------------------------------
@@ -413,7 +413,7 @@ fastEval ienv γ ctx e
 --   as coercions. See tests/proof/ple1.fq
 --------------------------------------------------------------------------------
 
-unfoldExpr :: ConstMap -> Knowledge -> ICtx -> SEnv Sort -> Expr -> {-EvalST-} Expr
+unfoldExpr :: ConstMap -> Knowledge -> ICtx -> SymEnv -> Expr -> {-EvalST-} Expr
 unfoldExpr ie γ ctx env (EIte e0 e1 e2) = let g' = interpret' ie γ ctx env e0 in
                                              if g' == PTrue
                                                 then unfoldExpr ie γ ctx env e1
@@ -422,45 +422,11 @@ unfoldExpr ie γ ctx env (EIte e0 e1 e2) = let g' = interpret' ie γ ctx env e0 
                                                         else EIte g' e1 e2
 unfoldExpr _  _ _   _   e               = e
 
-substEq :: SEnv Sort -> Equation -> [Expr] -> Expr
-substEq env eq es = subst su (substEqCoerce env eq es)
-  where su = mkSubst $ zip (eqArgNames eq) es
 
-substEqCoerce :: SEnv Sort -> Equation -> [Expr] -> Expr
-substEqCoerce env eq es = Vis.applyCoSub coSub $ eqBody eq
-  where
-    ts    = snd    <$> eqArgs eq
-    sp    = panicSpan "mkCoSub"
-    eTs   = sortExpr sp env <$> es
-    coSub = mkCoSub env eTs ts
-
-mkCoSub :: SEnv Sort -> [Sort] -> [Sort] -> Vis.CoSub
-mkCoSub env eTs xTs = M.fromList [ (x, unite ys) | (x, ys) <- Misc.groupList xys ]
-  where
-    unite ts    = Mb.fromMaybe (uError ts) (unifyTo1 symToSearch ts)
-    symToSearch = mkSearchEnv env
-    uError ts   = panic ("mkCoSub: cannot build CoSub for " ++ showpp xys ++ " cannot unify " ++ showpp ts)
-    xys         = Misc.sortNub $ concat $ zipWith matchSorts _xTs _eTs
-    (_xTs,_eTs) = (xTs, eTs)
-
-matchSorts :: Sort -> Sort -> [(Symbol, Sort)]
-matchSorts = go
-  where
-    go (FObj x)      {-FObj-} y    = [(x, y)]
-    go (FAbs _ t1)   (FAbs _ t2)   = go t1 t2
-    go (FFunc s1 t1) (FFunc s2 t2) = go s1 s2 ++ go t1 t2
-    go (FApp s1 t1)  (FApp s2 t2)  = go s1 s2 ++ go t1 t2
-    go _             _             = []
-
---------------------------------------------------------------------------------
-
-eqArgNames :: Equation -> [Symbol]
-eqArgNames = map fst . eqArgs
-
-interpret' :: ConstMap -> Knowledge -> ICtx -> SEnv Sort -> Expr -> Expr
+interpret' :: ConstMap -> Knowledge -> ICtx -> SymEnv -> Expr -> Expr
 interpret' ie γ ctx env e = mytracepp ("Interpreting " ++ show e) $ interpret ie γ ctx env e
 
-interpret :: ConstMap -> Knowledge -> ICtx -> SEnv Sort -> Expr -> Expr
+interpret :: ConstMap -> Knowledge -> ICtx -> SymEnv -> Expr -> Expr
 interpret _  _ _   _   e@(ESym _)       = e
 interpret _  _ _   _   e@(ECon _)       = e
 interpret ie γ ctx env (EVar sym)
@@ -477,9 +443,12 @@ interpret cmap know ictx ssenv e@(EApp _ _)     = case splitEApp e of
       interpretApp ie γ ctx env (EVar f) es
         | Just eq <- M.lookup f (knAms γ)
         , length (eqArgs eq) <= length es
-        = let (es1,es2) = splitAt (length (eqArgs eq)) es
-              ges       = substEq env eq es1
-              exp1      = unfoldExpr ie γ ctx env ges
+        , let (es1,es2) = splitAt (length (eqArgs eq)) es
+        , Right ges <- instantiateEquationEAt
+            (ElabFlags (seSetBag env) False) env
+            (foldr (uncurry insertSEnv) mempty (knLams γ))
+            "interpreter equation instance" Nothing eq (eApps (EVar f) es1)
+        = let exp1      = unfoldExpr ie γ ctx env ges
               exp2      = eApps exp1 es2 in  --exp' -- TODO undo
             if eApps (EVar f) es == exp2 then exp2 else interpret' ie γ ctx env exp2
 

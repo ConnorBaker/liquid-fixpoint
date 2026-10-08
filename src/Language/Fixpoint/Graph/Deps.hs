@@ -78,7 +78,23 @@ sliceKVars fi sl = S.fromList $ concatMap (subcKVars be) cs
     cm           = F.cm fi
 
 subcKVars :: (F.TaggedC c a) => F.BindEnv a -> c a -> [F.KVar]
-subcKVars be c = V.envKVars be c ++ V.rhsKVars c
+subcKVars be c = subcReads be c ++ V.rhsKVars c
+
+-- The head of a RHS KVar is written; predicates in its actual arguments
+-- are read.  On the LHS both the head and all nested arguments are read.
+subcReads :: (F.TaggedC c a) => F.BindEnv a -> c a -> [F.KVar]
+subcReads be c =
+  S.toList $
+    S.unions $
+      actualReads (F.crhs c)
+        : [M.keysSet (F.exprKVars (F.reftPred (F.sr_reft sr))) | (_, sr) <- F.clhs be c]
+
+actualReads :: F.Expr -> S.HashSet F.KVar
+actualReads = V.fold ((V.defaultFolder :: V.Folder (S.HashSet F.KVar) ()){V.accExpr = collect}) () mempty
+ where
+  collect _ (F.PKVar _ _ su) =
+    S.unions (map (M.keysSet . F.exprKVars) (M.elems (F.fromKVarSubst su)))
+  collect _ _ = mempty
 
 --------------------------------------------------------------------------------
 mkSlice :: (F.TaggedC c a) => F.GInfo c a -> Slice
@@ -99,10 +115,14 @@ mkSlice_ :: F.TaggedC c a
          -> (G.Vertex -> F.SubcId)
          -> (F.SubcId -> G.Vertex)
          -> Slice
-mkSlice_ cm g' es v2i i2v = Slice { slKVarCs = kvarCs
-                                  , slConcCs = concCs
-                                  , slEdges  = sliceEdges kvarCs es
-                                  }
+mkSlice_ cm g' es v2i i2v
+    | null concCs = Slice [] [] []
+    | otherwise =
+        Slice
+            { slKVarCs = kvarCs
+            , slConcCs = concCs
+            , slEdges = sliceEdges kvarCs es
+            }
   where
     -- n                  = length kvarCs
     concCs             = [ i | (i, c) <- M.toList cm, isTarget c ]
@@ -186,7 +206,7 @@ kvWriteBy cm = V.kvarsExpr . F.crhs . lookupCMap cm
 kvReadBy :: (F.TaggedC c a) => F.GInfo c a -> KVRead
 --------------------------------------------------------------------------------
 kvReadBy fi = group [ (k, i) | (i, ci) <- M.toList cm
-                             , k       <- V.envKVars bs ci]
+                             , k       <- subcReads bs ci]
   where
     cm      = F.cm fi
     bs      = F.bs fi
@@ -202,7 +222,12 @@ kvGraph :: (F.TaggedC c a) => F.GInfo c a -> KVGraph
 kvGraph = edgeGraph . kvEdges
 
 edgeGraph :: [CEdge] -> KVGraph
-edgeGraph es = KVGraph [(v, v, vs) | (v, vs) <- groupList es ]
+edgeGraph es = KVGraph [(v, v, vs) | (v, vs) <- M.toList adjacency]
+  where
+    -- Sink vertices still own equations and must enter SCC classification.
+    -- Dropping one here leaves its defining constraint outside both the
+    -- retained query and the elimination that updates worklist dependencies.
+    adjacency = M.union (group es) (M.fromList [(v, []) | (_, v) <- es])
 
 -- need to plumb list of ebinds
 
@@ -225,7 +250,7 @@ fiKVars :: F.GInfo c a -> [F.KVar]
 fiKVars = M.keys . F.ws
 
 subcEdges :: (F.TaggedC c a) => F.BindEnv a -> c a -> [CEdge]
-subcEdges bs c =  [(KVar k, Cstr i ) | k  <- V.envKVars bs c]
+subcEdges bs c =  [(KVar k, Cstr i ) | k  <- subcReads bs c]
                ++ [(Cstr i, KVar k') | k' <- V.rhsKVars c ]
   where
     i          = F.subcId c
@@ -323,16 +348,29 @@ forceKuts xs (Deps cs ns) = Deps (S.union cs xs) (S.difference ns xs)
 
 {-# SCC edgeDeps #-}
 edgeDeps :: (F.TaggedC c a) => Config -> F.GInfo c a -> [CEdge] -> Elims F.KVar
-edgeDeps cfg si  = forceKuts ks
-                 . edgeDeps' cfg
-                 . removeKutEdges ks
-                 . filter isRealEdge
-  where
-    ks           = givenKs `S.union` nlKs
-    givenKs      = cutVars cfg    si
-    nlKs
-      | nonLinCuts cfg = nonLinearKVars si
-      | otherwise      = mempty
+edgeDeps cfg si =
+  forceKuts ks
+    . edgeDeps' cfg
+    . removeKutEdges ks
+    . filter isRealEdge
+ where
+  ks = givenKs `S.union` nlKs `S.union` retainedDefinitions
+  givenKs = cutVars cfg si
+  -- A Cube stores fixed actuals in the KVar's original type context.
+  -- It cannot invert a defining type instantiation or interpret an actual
+  -- that depends on the evolving solution. Keep those original constraints
+  -- in occurrence-typed inference; do not approximate their entire component.
+  retainedDefinitions =
+    S.fromList
+      [ k
+      | c <- M.elems (F.cm si)
+      , F.PKVar k types su <- F.splitPAnd (F.crhs c)
+      , any (\(name, sort) -> sort /= F.FObj name) (M.toList types)
+          || any (not . M.null . F.exprKVars) (M.elems (F.fromKVarSubst su))
+      ]
+  nlKs
+    | nonLinCuts cfg = nonLinearKVars si
+    | otherwise = mempty
 
 edgeDeps' :: Config -> [CEdge] -> Elims F.KVar
 edgeDeps' cfg es = Deps (takeK cs) (takeK ns)

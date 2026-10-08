@@ -1,3 +1,4 @@
+// Concrete append calls explicitly instantiate the shared element sort at int.
 qualif Append(v : [@(0)], xs : [@(0)], ys : [@(0)]) { len([v]) = (len([xs]) + len([ys]))  } // "tests/pos/listqual.hs" (line 3, column 12)
 qualif Fst(v : @(1), y : @(0)) { v = fst([y])  } // "/Users/rjhala/research/stack/liquid/liquidhaskell/.stack-work/install/x86_64-osx/nightly-2015-09-24/7.10.2/share/x86_64-osx-ghc-7.10.2/liquidhaskell-0.5.0.2/include/GHC/Base.spec" (line 29, column 8)
 qualif Snd(v : @(1), y : @(0)) { v = snd([y])  } // "/Users/rjhala/research/stack/liquid/liquidhaskell/.stack-work/install/x86_64-osx/nightly-2015-09-24/7.10.2/share/x86_64-osx-ghc-7.10.2/liquidhaskell-0.5.0.2/include/GHC/Base.spec" (line 30, column 8)
@@ -213,9 +214,9 @@ bind 29 lq_anf__dx1 : {lq_tmp_x_325 : [int] | [(len([lq_tmp_x_325]) = (1 + len([
                                                (len([lq_tmp_x_325]) >= 0)]}
 bind 30 ListQual.boo$35$rlx : {v : [int] | [(len([v]) = 2);
                                             (len([v]) >= 0)]}
-bind 31 VV$35$368 : {VV$35$368 : [int] | [$k__185[lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][lq_tmp_x_350:=VV$35$368][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$368][lq_tmp_x_190:=lq_anf__dx1];
+bind 31 VV$35$368 : {VV$35$368 : [int] | [$k__185[@a_awA:=int][lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][lq_tmp_x_350:=VV$35$368][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$368][lq_tmp_x_190:=lq_anf__dx1];
                                           (len([VV$35$368]) >= 0)]}
-bind 32 VV$35$368 : {VV$35$368 : [int] | [$k__185[lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][lq_tmp_x_350:=VV$35$368][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$368][lq_tmp_x_190:=lq_anf__dx1];
+bind 32 VV$35$368 : {VV$35$368 : [int] | [$k__185[@a_awA:=int][lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][lq_tmp_x_350:=VV$35$368][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$368][lq_tmp_x_190:=lq_anf__dx1];
                                           (len([VV$35$368]) >= 0)]}
 bind 33 VV$35$371 : {VV$35$371 : int | [$k__356[lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_353:=lq_anf__dwY][VV$35$355:=VV$35$371][lq_tmp_x_350:=VV$35$368][lq_tmp_x_358:=VV$35$371];
                                         $k__178[lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][VV$35$177:=VV$35$371][lq_tmp_x_350:=VV$35$368][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][lq_tmp_x_358:=VV$35$371][VV$35$184:=VV$35$368][lq_tmp_x_190:=lq_anf__dx1]]}
@@ -348,7 +349,7 @@ constraint:
 
 constraint:
   env [0; 1; 2; 3; 4; 20; 5; 6; 22; 7; 8; 24; 25; 27; 29; 31]
-  lhs {VV$35$F1 : [int] | [$k__185[lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][VV$35$F:=VV$35$F1][lq_tmp_x_350:=VV$35$F1][VV$35$368:=VV$35$F1][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$F1][lq_tmp_x_190:=lq_anf__dx1];
+  lhs {VV$35$F1 : [int] | [$k__185[@a_awA:=int][lq_tmp_x_354:=lq_anf__dx1][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][VV$35$F:=VV$35$F1][lq_tmp_x_350:=VV$35$F1][VV$35$368:=VV$35$F1][lq_tmp_x_188:=lq_anf__dx1][ys$35$awn:=lq_anf__dx1][VV$35$184:=VV$35$F1][lq_tmp_x_190:=lq_anf__dx1];
                            (len([VV$35$F1]) >= 0)]}
   rhs {VV$35$F1 : [int] | [(len([VV$35$F1]) = 2)]}
   id 1 tag [2]
@@ -376,7 +377,7 @@ constraint:
   env [0; 1; 2; 3; 4; 20; 5; 6; 22; 38; 7; 8; 24; 25; 27; 29]
   lhs {VV$35$F2 : [int] | [(VV$35$F2 = lq_anf__dx1);
                            (len([VV$35$F2]) >= 0)]}
-  rhs {VV$35$F2 : [int] | [$k__175[lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][VV$35$F:=VV$35$F2][lq_tmp_x_348:=VV$35$F2][VV$35$174:=VV$35$F2][VV$35$378:=VV$35$F2]]}
+  rhs {VV$35$F2 : [int] | [$k__175[@a_awA:=int][lq_tmp_x_187:=lq_anf__dwY][lq_tmp_x_189:=lq_anf__dwY][lq_tmp_x_353:=lq_anf__dwY][ds_dwT:=lq_anf__dwY][VV$35$F:=VV$35$F2][lq_tmp_x_348:=VV$35$F2][VV$35$174:=VV$35$F2][VV$35$378:=VV$35$F2]]}
   id 2 tag [2]
   // META constraint id 2 : tests/pos/listqual.hs:10:18-20
 
@@ -432,7 +433,7 @@ constraint:
   env [0; 1; 2; 3; 4; 20; 5; 6; 22; 7; 8; 24; 25; 27; 29; 45]
   lhs {VV$35$F6 : [int] | [(VV$35$F6 = lq_anf__dwY);
                            (len([VV$35$F6]) >= 0)]}
-  rhs {VV$35$F6 : [int] | [$k__165[VV$35$164:=VV$35$F6][VV$35$F:=VV$35$F6][lq_tmp_x_346:=VV$35$F6][VV$35$388:=VV$35$F6]]}
+  rhs {VV$35$F6 : [int] | [$k__165[@a_awA:=int][VV$35$164:=VV$35$F6][VV$35$F:=VV$35$F6][lq_tmp_x_346:=VV$35$F6][VV$35$388:=VV$35$F6]]}
   id 6 tag [2]
   // META constraint id 6 : tests/pos/listqual.hs:10:14-16
 
@@ -440,7 +441,7 @@ constraint:
 constraint:
   env [0; 1; 2; 3; 4; 20; 5; 6; 22; 7; 8; 24; 25; 27; 29; 46; 47]
   lhs {VV$35$F8 : int | [$k__290[VV$35$289:=VV$35$F8][lq_tmp_x_288:=lq_anf__dwX][VV$35$F:=VV$35$F8][lq_tmp_x_292:=VV$35$F8][lq_tmp_x_362:=VV$35$388][lq_tmp_x_359:=VV$35$F8][lq_tmp_x_284:=VV$35$388][VV$35$391:=VV$35$F8][lq_tmp_x_287:=lq_anf__dwW]]}
-  rhs {VV$35$F8 : int | [$k__158[VV$35$164:=VV$35$388][VV$35$F:=VV$35$F8][lq_tmp_x_346:=VV$35$388][VV$35$157:=VV$35$F8][lq_tmp_x_358:=VV$35$F8][VV$35$391:=VV$35$F8]]}
+  rhs {VV$35$F8 : int | [$k__158[@a_awA:=int][VV$35$164:=VV$35$388][VV$35$F:=VV$35$F8][lq_tmp_x_346:=VV$35$388][VV$35$157:=VV$35$F8][lq_tmp_x_358:=VV$35$F8][VV$35$391:=VV$35$F8]]}
   id 8 tag [2]
   // META constraint id 8 : tests/pos/listqual.hs:10:14-16
 
@@ -448,7 +449,7 @@ constraint:
 constraint:
   env [0; 1; 49; 2; 50; 3; 4; 20; 5; 6; 22; 7; 8; 24; 25; 27; 29; 46]
   lhs {VV$35$F9 : int | [$k__294[lq_tmp_x_361:=VV$35$F9][lq_tmp_x_288:=lq_anf__dwX][VV$35$F:=VV$35$F9][lq_tmp_x_360:=lq_tmp_x_345][VV$35$293:=VV$35$F9][lq_tmp_x_292:=VV$35$F9][VV$35$395:=VV$35$F9][lq_tmp_x_362:=VV$35$388][lq_tmp_x_296:=lq_tmp_x_345][lq_tmp_x_283:=lq_tmp_x_345][lq_tmp_x_284:=VV$35$388][lq_tmp_x_287:=lq_anf__dwW]]}
-  rhs {VV$35$F9 : int | [$k__162[VV$35$164:=VV$35$388][VV$35$161:=VV$35$F9][lq_tmp_x_160:=lq_tmp_x_345][VV$35$F:=VV$35$F9][lq_tmp_x_346:=VV$35$388][VV$35$395:=VV$35$F9][lq_tmp_x_358:=VV$35$F9]]}
+  rhs {VV$35$F9 : int | [$k__162[@a_awA:=int][VV$35$164:=VV$35$388][VV$35$161:=VV$35$F9][lq_tmp_x_160:=lq_tmp_x_345][VV$35$F:=VV$35$F9][lq_tmp_x_346:=VV$35$388][VV$35$395:=VV$35$F9][lq_tmp_x_358:=VV$35$F9]]}
   id 9 tag [2]
   // META constraint id 9 : tests/pos/listqual.hs:10:14-16
 

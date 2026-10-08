@@ -1,0 +1,11 @@
+// Coinciding at Int does not identify the whole polymorphic family.
+data Token 0 = [ | First {} | Second {} ]
+constant family : func(1, [Set_Set @(0)])
+constant other : func(1, [Set_Set @(0)])
+bind 0 coincidence : {v : Set_Set int | v = family && v = other}
+
+constraint:
+  env [0]
+  lhs {v : Set_Set Token | v = family}
+  rhs {v : Set_Set Token | v = other}
+  id 0 tag []

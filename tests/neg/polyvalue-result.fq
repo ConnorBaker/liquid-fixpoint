@@ -1,0 +1,13 @@
+fixpoint "--rewrite"
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+constant produce : func(0, [int; Token])
+define produce (n : int) : Token = {undef}
+
+constraint:
+  env []
+  lhs {v : Token | v = produce 0}
+  rhs {v : Token | v = First}
+  id 0 tag []
+
+expand [0 : True]

@@ -2,6 +2,10 @@
 
 ## NEXT
 
+- Check `~~` and `!~` against the source sorts before SMT serialization:
+  reject incompatible aggregate relations, while accepting Set/Bag and Array
+  carriers only when the configured encoding makes their representations equal.
+
 ## 0.9.6.3.7 (2026-06-04)
 
 - Migrate from cmdargs to base:System.Console.GetOpt

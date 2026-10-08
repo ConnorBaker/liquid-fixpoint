@@ -29,7 +29,7 @@ nontrivsorts :: (Fixpoint a) => Config -> FInfo a -> IO (Result a)
 nontrivsorts cfg fi = do
   let fi' = simplify' cfg fi
   writeFInfo cfg fi' $ queryFile Out cfg
-  return mempty
+  return safe
 
 simplify' :: Config -> FInfo a -> FInfo a
 simplify' _ fi = simplifyFInfo (mkNonTrivSorts fi) fi

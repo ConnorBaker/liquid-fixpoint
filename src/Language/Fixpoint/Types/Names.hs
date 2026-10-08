@@ -27,6 +27,7 @@ module Language.Fixpoint.Types.Names (
 
   -- * Conversion to/from Text
   , symbolSafeText
+  , symbolSmtText
   , symbolSafeString
   , symbolText
   , symbolString
@@ -183,14 +184,16 @@ type SafeText = T.Text
 --   where i is a unique integer (for each text)
 
 data Symbol
-  = S { _symbolId      :: !Id
-      , symbolRaw      :: T.Text
-      , symbolEncoded  :: T.Text
-      }
-    deriving (Data, Typeable, Generic)
+  = S
+  { _symbolId :: !Id
+  , symbolRaw :: T.Text
+  , symbolEncoded :: T.Text
+  , symbolSmtEncoded :: T.Text
+  }
+  deriving (Data, Typeable, Generic)
 
 instance Eq Symbol where
-  S i _ _ == S j _ _ = i == j
+  S i _ _ _ == S j _ _ _ = i == j
 
 instance Ord Symbol where
   -- compare (S i _ _) (S j _ _) = compare i j
@@ -200,19 +203,19 @@ instance Ord Symbol where
 instance Interned Symbol where
   type Uninterned Symbol = T.Text
   newtype Description Symbol = DT T.Text deriving (Eq)
-  describe     = DT
-  identify i t = S i t (encode t)
-  cache        = sCache
+  describe = DT
+  identify i t = S i t (encode t) (encodeSmt t)
+  cache = sCache
 
 instance Uninternable Symbol where
-  unintern (S _ t _) = t
+  unintern (S _ t _ _) = t
 
 instance Hashable (Description Symbol) where
   hashWithSalt s (DT t) = {-# SCC "hashWithSalt-Description-Symbol" #-} hashWithSalt s t
 
 instance Hashable Symbol where
   -- NOTE: hash based on original text rather than id
-  hashWithSalt s (S _ t _) = hashWithSalt s t
+  hashWithSalt s (S _ t _ _) = hashWithSalt s t
 
 instance Binder Symbol where
   wildcard = vv Nothing
@@ -309,6 +312,14 @@ symbolString = T.unpack . symbolText
 symbolSafeText :: Symbol -> SafeText
 symbolSafeText = symbolEncoded
 
+{- | Keep ordinary SMT identifiers separate from native syntax and operators.
+The existing keyword prefix supplies a legal first character, so escape the
+raw spelling without 'prefixAlpha' (which is not injective on arbitrary text).
+Other symbol formats retain 'symbolSafeText'; theory tokens remain Raw.
+-}
+symbolSmtText :: Symbol -> SafeText
+symbolSmtText = symbolSmtEncoded
+
 symbolSafeString :: Symbol -> String
 symbolSafeString = T.unpack . symbolSafeText
 
@@ -327,26 +338,29 @@ encode t
   | isFixKey t     = T.append "key$" t
   | otherwise      = encodeUnsafe t
 
+encodeSmt :: T.Text -> SafeText
+encodeSmt = ("key$" <>) . T.pack . escapeSymbolChars . T.unpack
+
 isFixKey :: T.Text -> Bool
 isFixKey x = S.member x keywords
 
 {-# SCC encodeUnsafe #-}
 encodeUnsafe :: T.Text -> T.Text
-encodeUnsafe t = T.pack $ pad $ go $ T.unpack (prefixAlpha t)
+encodeUnsafe t = T.pack $ pad $ escapeSymbolChars $ T.unpack (prefixAlpha t)
   where
-    pad cs@('$':_) = 'z' : '$' : cs
+    pad cs@('$' : _) = 'z' : '$' : cs
     pad cs = cs
-    go [] = []
-    go (c:cs) =
-      if isUnsafeChar c then
-        '$' : shows (ord c) ('$' : go cs)
-      else
-        c : go cs
+
+escapeSymbolChars :: String -> String
+escapeSymbolChars [] = []
+escapeSymbolChars (c : cs)
+    | isUnsafeChar c = '$' : shows (ord c) ('$' : escapeSymbolChars cs)
+    | otherwise = c : escapeSymbolChars cs
 
 prefixAlpha :: T.Text -> T.Text
 prefixAlpha t
-  | isAlpha0 t = t
-  | otherwise  = T.append "fix$" t
+    | isAlpha0 t = t
+    | otherwise = T.append "fix$" t
 
 isAlpha0 :: T.Text -> Bool
 isAlpha0 t = case T.uncons t of
@@ -601,7 +615,7 @@ instance Symbolic Symbol where
   symbol = id
 
 symbolBuilder :: (Symbolic a) => a -> Builder
-symbolBuilder = Builder.fromText . symbolSafeText . symbol
+symbolBuilder = Builder.fromText . symbolSmtText . symbol
 
 {-# INLINE buildMany #-}
 buildMany :: [Builder] -> Builder

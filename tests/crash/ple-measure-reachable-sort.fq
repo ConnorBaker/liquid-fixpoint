@@ -1,0 +1,15 @@
+fixpoint "--rewrite"
+
+data Token 0 = [ | First {} ]
+constant choose : func(0, [Token; int])
+
+// The selected branch is Boolean, and cannot be asserted as an Int result.
+match choose First { if (0 == 1) then 11 else true }
+
+constraint:
+  env []
+  lhs {v : int | true}
+  rhs {v : int | choose First == 11}
+  id 1 tag []
+
+expand [1 : True]

@@ -66,7 +66,7 @@ module Language.Fixpoint.Types.Constraints (
   , FixSolution
   , FixDelayedSolution
   , Delayed (..)
-  , Result (..), ResultSorts
+  , Result (..), Formal (..), ResultScopes, SourceScopes
   , unsafe, isUnsafe, isSafe ,safe
 
   -- * Cut KVars
@@ -254,9 +254,11 @@ subcId = mfromJust "subCId" . sid
 data Delayed a = Delayed
   { forceDelayed  :: a
   }
-  deriving (Generic, Show, Functor)
+  deriving (Eq, Generic, Show, Functor)
 
-instance (NFData a) => NFData (Delayed a)
+-- A delayed result is forced only by an explicit forceDelayed consumer.
+instance NFData (Delayed a) where
+  rnf (Delayed _) = ()
 
 
 type FixSolution  = M.HashMap KVar Expr
@@ -266,11 +268,24 @@ data Result a = Result
   { resStatus    :: !(FixResult a)
   , resSolution  :: !FixSolution
   , resNonCutsSolution :: !FixDelayedSolution
-  , resSorts     :: !ResultSorts
+  , resScopes    :: !ResultScopes
   }
   deriving (Generic, Show, Functor)
 
-type ResultSorts = M.HashMap KVar [(Symbol, Sort)]
+data Formal = Formal
+  { formalSource :: !Symbol
+  , formalCanonical :: !Symbol
+  , formalSort :: !Sort
+  }
+  deriving (Eq, Generic, Show)
+
+instance NFData Formal
+
+type ResultScopes = M.HashMap KVar [Formal]
+
+-- Final canonical formal name to its source occurrence name, per KVar.
+-- Several canonical names may refer to the same source actual.
+type SourceScopes = M.HashMap KVar (M.HashMap Symbol Symbol)
 
 data ScopedResult = MkScopedResult
   { scCuts    :: KVarMap ScopedExpr
@@ -299,7 +314,7 @@ scopedResult res = MkScopedResult cuts  nonCuts
     cuts = scoped $ resSolution res
     nonCuts = scoped $ M.map forceDelayed $ resNonCutsSolution res
     scoped sol = MkKVarMap $ M.fromList [ (k, MkScopedExpr (scope k) e) | (k, e) <- M.toList sol]
-    scope k = M.lookupDefault [] k $ resSorts res
+    scope k = [(formalCanonical f, formalSort f) | f <- M.lookupDefault [] k (resScopes res)]
 
 instance ToJSON a => ToJSON (Result a) where
   toJSON r@(Result {..}) = object
@@ -322,21 +337,9 @@ instance ToJSON a => ToJSON (KVarMap a) where
 instance ToJSON ScopedExpr where
   toJSON = toJSON . render . toHornSMT
 
-instance Semigroup (Result a) where
-  r1 <> r2  = Result stat soln nonCutsSoln sorts
-    where
-      stat  = resStatus r1    <> resStatus r2
-      soln  = resSolution r1  <> resSolution r2
-      nonCutsSoln = resNonCutsSolution r1 <> resNonCutsSolution r2
-      sorts = M.unionWith L.union (resSorts r1) (resSorts r2)
-
-instance Monoid (Result a) where
-  mempty        = Result mempty mempty mempty mempty
-  mappend       = (<>)
-
 unsafe, safe :: Result a
-unsafe = mempty {resStatus = Unsafe mempty []}
-safe   = mempty {resStatus = Safe mempty}
+unsafe = Result (Unsafe mempty []) mempty mempty mempty
+safe   = Result (Safe mempty) mempty mempty mempty
 
 isSafe :: Result a -> Bool
 isSafe r = case resStatus r of
@@ -962,6 +965,11 @@ data AxiomEnv = AEnv
   , aenvSimpl    :: ![Rewrite]
   , aenvExpand   :: M.HashMap SubcId Bool
   , aenvAutoRW   :: M.HashMap SubcId [AutoRewrite]
+  -- Nothing is the legacy raw-query policy: every equation is native-total.
+  -- Just names permits native unfolding only for those independently checked
+  -- owners; all other equations require source demand. This is query meaning,
+  -- not an out-of-band option, so it must survive saving and replay.
+  , aenvNative   :: Maybe (S.HashSet Symbol)
   } deriving (Eq, Show, Generic)
 
 newtype LocalRewrites = LocalRewrites (M.HashMap Symbol Expr)
@@ -995,15 +1003,21 @@ dedupAutoRewrites :: M.HashMap SubcId [AutoRewrite] -> [AutoRewrite]
 dedupAutoRewrites = Set.toList . Set.unions . map Set.fromList . M.elems
 
 instance Semigroup AxiomEnv where
-  a1 <> a2        = AEnv aenvEqs' aenvSimpl' aenvExpand' aenvAutoRW'
+  a1 <> a2        = AEnv aenvEqs' aenvSimpl' aenvExpand' aenvAutoRW' aenvNative'
     where
       aenvEqs'    = aenvEqs a1    <> aenvEqs a2
       aenvSimpl'  = aenvSimpl a1  <> aenvSimpl a2
       aenvExpand' = aenvExpand a1 <> aenvExpand a2
       aenvAutoRW' = aenvAutoRW a1 <> aenvAutoRW a2
+      -- A combined query obeys both authority bounds. Union could authorize
+      -- an uncertified same-named definition from the other operand.
+      aenvNative' = case (aenvNative a1, aenvNative a2) of
+        (Nothing, policy) -> policy
+        (policy, Nothing) -> policy
+        (Just left, Just right) -> Just (S.intersection left right)
 
 instance Monoid AxiomEnv where
-  mempty          = AEnv [] [] (M.fromList []) (M.fromList [])
+  mempty          = AEnv [] [] (M.fromList []) (M.fromList []) Nothing
   mappend         = (<>)
 
 instance PPrint AxiomEnv where
@@ -1106,10 +1120,12 @@ instance Fixpoint AxiomEnv where
   toFix axe = vcat ((toFix <$> L.sort (aenvEqs axe)) ++ (toFix <$> L.sort (aenvSimpl axe)))
               $+$ renderExpand (pairdoc <$> L.sort (M.toList $ aenvExpand axe))
               $+$ autoRWToFix (aenvAutoRW axe)
+              $+$ maybe empty renderNative (aenvNative axe)
     where
       pairdoc (x,y) = text $ show x ++ " : " ++ show y
       renderExpand [] = empty
       renderExpand xs = text "expand" <+> toFix xs
+      renderNative names = text "nativeequations" <+> toFix (L.sort (S.toList names))
 
 instance Fixpoint Equation where
   toFix (Equ f xs e s _) = "define" <+> toFix f <+> ppArgs xs <+> ":" <+> toFix s <+> text "=" <+> braces (parens (toFix e))

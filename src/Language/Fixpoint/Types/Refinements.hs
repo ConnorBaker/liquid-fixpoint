@@ -449,6 +449,8 @@ exprSymbolsSet = go
     go (ELet x e1 e2)     = HashSet.union (go e1) (HashSet.delete x $ go e2)
     go (EIte p e1 e2)     = gos [p, e1, e2]
     go (ECst e _)         = go e
+    go (ETApp e _)        = go e
+    go (ETAbs e _)        = go e
     go (PAnd ps)          = gos ps
     go (POr ps)           = gos ps
     go (PNot p)           = go p
@@ -480,13 +482,14 @@ sortSubstInExpr f = onEverySubexpr go
       PAll xts e -> PAll (second (sortSubst f) <$> xts) e
       PExist xts e -> PExist (second (sortSubst f) <$> xts) e
       ECst e t -> ECst e (sortSubst f t)
+      ETApp e t -> ETApp e (sortSubst f t)
       ECoerc t0 t1 e -> ECoerc (sortSubst f t0) (sortSubst f t1) e
       e -> e
 
 exprKVars :: Expr -> HashMap KVar [KVarSubst Symbol Symbol]
 exprKVars = go
   where
-    gos es                = HashMap.unions (go <$> es)
+    gos es                = foldr (HashMap.unionWith (++)) HashMap.empty (go <$> es)
     go (EVar _)           = HashMap.empty
     go (EApp f e)         = gos [f, e]
     go (ELam _ e)     = go e
@@ -503,7 +506,7 @@ exprKVars = go
     go (PImp p1 p2)       = gos [p1, p2]
     go (PAtom _ e1 e2)    = gos [e1, e2]
     go (PKVar k _ su) =
-      HashMap.insertWith (++) k [su] $ HashMap.unions $ map exprKVars (M.elems $ fromKVarSubst su)
+      HashMap.insertWith (++) k [su] $ gos (M.elems $ fromKVarSubst su)
     go (PAll _xts p)       = go p
     go (PExist _xts p)     = go p
     go _                  = HashMap.empty
@@ -540,7 +543,9 @@ eAppC s e1 e2 = eCst (EApp e1 e2) s
 
 -- | Eliminates redundant casts
 eCst :: Expr -> Sort -> Expr
-eCst e s = ECst (dropECst e) s
+eCst (ECst e source) target
+    | source == target = eCst e target
+eCst e s = ECst e s
 
 --------------------------------------------------------------------------------
 debruijnIndex :: Expr -> Int

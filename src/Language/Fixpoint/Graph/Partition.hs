@@ -88,7 +88,7 @@ partition :: (F.Fixpoint a, F.Fixpoint (c a), F.TaggedC c a) => Config -> F.GInf
 partition cfg fi
   = do dumpPartitions cfg fis
        -- writeGraph      f   g
-       return mempty
+       return F.safe
     where
       --f   = queryFile Dot cfg
       fis = partition' Nothing fi
