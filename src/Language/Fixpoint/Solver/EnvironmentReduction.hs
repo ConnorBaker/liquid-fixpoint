@@ -26,6 +26,7 @@ module Language.Fixpoint.Solver.EnvironmentReduction
 
 import           Control.Monad (guard, mplus, msum)
 import           Data.Char (isUpper)
+import           Data.Graph (SCC(..), stronglyConnComp)
 import           Data.Hashable (Hashable)
 import           Data.HashMap.Lazy (HashMap)
 import qualified Data.HashMap.Lazy as HashMap
@@ -93,9 +94,8 @@ import           Language.Fixpoint.Types.Refinements
   , sortedReftSymbols
   , fromKVarSubst
   )
-import           Language.Fixpoint.Types.Substitutions (subst1)
+import           Language.Fixpoint.Types.Substitutions (Subable(syms), mkSubst, subst, subst1)
 import           Language.Fixpoint.Types.Sorts (boolSort, sortSymbols)
-import           Language.Fixpoint.Types.Visitor (mapExprOnExpr)
 import Language.Fixpoint.Misc (snd3)
 
 -- | Strips from all the constraint environments the bindings that are
@@ -592,7 +592,7 @@ infixr 4 %~
 
 -- | Inlines some of the bindings whose symbol satisfies a given predicate.
 --
--- Only works if the bindings don't form cycles.
+-- Cyclic selected bindings remain in the result but are not inline candidates.
 substBindingsSimplifyingWith
   :: (SortedReft -> SortedReft)
   -> Lens' v SortedReft
@@ -600,12 +600,17 @@ substBindingsSimplifyingWith
   -> HashMap Symbol v
   -> HashMap Symbol v
 substBindingsSimplifyingWith simplifier vLens p env =
-    -- Circular program here. This should terminate as long as the
-    -- bindings introduced by ANF don't form cycles.
     let env' = HashMap.map (vLens %~ simplifier . inlineInSortedReft (srLookup filteredEnv)) env
-        filteredEnv = HashMap.filterWithKey (\sym _v -> p sym) env'
+        filteredEnv = HashMap.filterWithKey (\sym _v -> HashSet.member sym acyclic) env'
      in env'
   where
+    acyclic = HashSet.fromList [sym | AcyclicSCC sym <- stronglyConnComp nodes]
+    nodes = [(sym, sym, dependencies value) | (sym, value) <- HashMap.toList env, p sym]
+    -- Only free references demand an ambient binding. The refinement value
+    -- and nested lexical binders own their occurrences.
+    dependencies value =
+        let r = sr_reft (view vLens value)
+         in HashSet.toList (HashSet.delete (reftBind r) (syms (reftPred r)))
     srLookup env' sym = view vLens <$> HashMap.lookup sym env'
 
 substBindings
@@ -672,40 +677,36 @@ inlineInSortedReft srLookup sr =
 -- this function produces the expression @... e1 ...@ if @v@ does not
 -- appear free in @e1@.
 inlineInExpr :: (Symbol -> Maybe SortedReft) -> Expr -> Expr
-inlineInExpr srLookup = mapExprOnExpr inlineExpr
+inlineInExpr srLookup expression
+    | null replacements = expression
+    | otherwise = subst (mkSubst replacements) expression
   where
-    inlineExpr (EVar sym)
-      | Just sr <- srLookup sym
-      , let r = sr_reft sr
-      , Just e <- isSingletonE (reftBind r) (reftPred r)
-      = wrapWithCoercion Eq (sr_sort sr) e
-    inlineExpr (PAtom br e0 e1@(dropECst -> EVar sym))
-      | isEq br
-      , Just sr <- srLookup sym
-      , let r = sr_reft sr
-      , Just e <- isSingletonE (reftBind r) (reftPred r)
-      =
-        PAtom br e0 $ subst1 e1 (sym, wrapWithCoercion br (sr_sort sr) e)
-    inlineExpr e = e
+    replacements =
+        [ (sym, wrapWithCoercion (sr_sort sr) e)
+        | sym <- HashSet.toList (syms expression)
+        , Just sr <- [srLookup sym]
+        , let r = sr_reft sr
+        , Just e <- [isSingletonE (reftBind r) (reftPred r)]
+        ]
 
     isSingletonE v (PAtom br e0 e1)
-      | isEq br = isSingEq v e0 e1 `mplus` isSingEq v e1 e0
+        | isEq br = isSingEq v e0 e1 `mplus` isSingEq v e1 e0
     isSingletonE v (PIff e0 e1) =
-      isSingEq v e0 e1 `mplus` isSingEq v e1 e0
+        isSingEq v e0 e1 `mplus` isSingEq v e1 e0
     isSingletonE v (PAnd cs) =
-      msum $ map (isSingletonE v) cs
+        msum $ map (isSingletonE v) cs
     isSingletonE _ _ =
-      Nothing
+        Nothing
 
     isSingEq v e0 e1 = do
-      guard $ EVar v == dropECst e0 && not (HashSet.member v $ exprSymbolsSet e1)
-      Just e1
+        guard $ EVar v == dropECst e0 && not (HashSet.member v $ exprSymbolsSet e1)
+        Just e1
 
     isEq r = r == Eq || r == Ueq
 
-    wrapWithCoercion br to e = case exprSortMaybe e of
-      Just from -> if from /= to then ECoerc from to e else e
-      Nothing -> if br == Ueq then ECst e to else e
+    wrapWithCoercion to e = case exprSortMaybe e of
+        Just from -> if from /= to then ECoerc from to e else e
+        Nothing -> e
 
 -- | Transforms bindings of the form @{v:bool | v && P v}@ into
 -- @{v:Bool | v && P true}@, and bindings of the form @{v:bool | ~v && P v}@

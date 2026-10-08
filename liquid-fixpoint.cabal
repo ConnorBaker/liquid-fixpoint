@@ -227,14 +227,36 @@ test-suite tasty
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   other-modules:    Arbitrary
+                    ArrayConstantTests
+                    ConfiguredStringTests
+                    EtaFreshnessTests
                     InterpretTests
+                    ModelFilterTests
+                    NativeCallableTests
+                    NestedKVarActualTests
+                    EliminatedSharingTests
+                    ClosureLiftingTests
+                    EliminatedSharingSupport
+                    SummaryScopeTests
                     ParserTests
+                    PLEAuthorityTests
+                    PolyFamilyTests
+                    PreparedElaborationTests
+                    NativeCarrierInferenceTests
+                    QueryAuthorityTests
+                    RootSortCheckTests
+                    ScopedSubstitutionTests
+                    SortInventoryTests
+                    SortJudgmentTests
+                    SourceCheckScopeTests
                     ShareMapReference
                     ShareMapTests
                     SimplifyInterpreter
                     SimplifyKVarTests
                     SimplifyPLE
                     SimplifyTests
+                    SolutionPresentationTests
+                    SmtScopeTests
                     UndoANFTests
                     Paths_liquid_fixpoint
   if impl(ghc>=9.12.1)
@@ -245,12 +267,23 @@ test-suite tasty
   hs-source-dirs:   tests/tasty
   ghc-options:      -threaded
   build-depends:    base            >= 4.9.1.0 && < 5
+                  , aeson
+                  , bytestring
                   , containers
+                  , deepseq
+                  , filepath
                   , hashable
                   , liquid-fixpoint
+                  , mtl
+                  , pretty
+                  , process
+                  , smtlib-backends
+                  , store
+                  , syb
                   , tasty           >= 0.10
                   , tasty-hunit     >= 0.9
                   , tasty-quickcheck
+                  , temporary
                   , text
                   , unordered-containers
   if flag(devel)

@@ -9,7 +9,7 @@ import Language.Fixpoint.Smt.Types (SmtM)
 import Language.Fixpoint.Types
 import Language.Fixpoint.Types.Visitor (kvarsExpr)
 import Language.Fixpoint.Defunctionalize (defuncAny)
-import Language.Fixpoint.SortCheck (ElabParam(..), elaborate)
+import Language.Fixpoint.SortCheck (elaborateExpr)
 import GHC.Stack (HasCallStack)
 
 mytracepp :: (PPrint a) => String -> a -> a
@@ -30,12 +30,15 @@ askSMT cfg bsInSMT xs e
          checkValidWithContext xs PTrue e'
   | otherwise          = return False
 
-toSMT :: HasCallStack => String -> Config -> Context -> [(Symbol, Sort)] -> Expr -> Pred
+toSMT :: (HasCallStack) => String -> Config -> Context -> [(Symbol, Sort)] -> Expr -> Pred
 toSMT msg cfg ctx xs e =
-    defuncAny cfg symenv .
-        elaborate (ElabParam (solverFlags cfg) (dummyLoc msg) (elabEnv xs)) .
-            mytracepp ("toSMT from " ++ msg ++ " > " ++ showpp e) $
-                e
+    defuncAny cfg symenv $
+        elaborateExpr
+            (solverFlags cfg)
+            symenv
+            (fromListSEnv xs)
+            (dummyLoc msg)
+            (mytracepp ("toSMT from " ++ msg ++ " > " ++ showpp e) e)
+            Nothing
   where
-    elabEnv = insertsSymEnv symenv
-    symenv  = ctxSymEnv ctx
+    symenv = ctxSymEnv ctx

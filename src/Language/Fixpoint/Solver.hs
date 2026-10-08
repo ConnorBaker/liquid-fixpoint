@@ -26,25 +26,26 @@ module Language.Fixpoint.Solver (
 
 import           Control.Concurrent                 (setNumCapabilities)
 import qualified Data.HashMap.Strict              as HashMap
+import qualified Data.List                       as L
 import qualified Data.Store                       as S
 import           Data.Aeson                         (ToJSON, encode)
 import qualified Data.Text.Lazy.IO                as LT
 import qualified Data.Text.Lazy.Encoding          as LT
 import           System.Exit                        (ExitCode (..))
 import           Language.Fixpoint.Verbosity   (whenNormal, whenLoud)
-import           Control.Monad                      (when)
+import           Control.Monad                      (when, foldM)
 import           Control.Exception                  (SomeException, catch)
 import           Control.Exception.Compat
     (ExceptionWithContext(..), displayExceptionContext, wrapExceptionWithContext)
 import           Language.Fixpoint.Solver.EnvironmentReduction
   (reduceEnvironments, simplifyBindings)
-import           Language.Fixpoint.Solver.Sanitize  (symbolEnv, sanitize)
+import           Language.Fixpoint.Solver.Sanitize  (symbolEnv, sanitize, shareFunctionLets)
 import           Language.Fixpoint.Solver.UniqifyBinds (renameAll)
 import           Language.Fixpoint.Defunctionalize (defunctionalize)
-import           Language.Fixpoint.SortCheck            (ElabParam (..), Elaborate (..), unElab, unElabFSetBagZ3, theoryEnv)
+import           Language.Fixpoint.SortCheck            (ElabParam (..), Elaborate (..), theoryEnv)
 import           Language.Fixpoint.Solver.Extensionality (expand)
 import           Language.Fixpoint.Solver.Prettify (savePrettifiedQuery)
-import           Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify)
+import           Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify, FormalOrigin (..), WfOrigins)
 import qualified Language.Fixpoint.Solver.Solve     as Sol
 import qualified Language.Fixpoint.Solver.Solution  as Sol
 import           Language.Fixpoint.Types.Config
@@ -176,7 +177,21 @@ inParallelUsing :: (a -> IO (Result b)) -> [a] -> IO (Result b)
 inParallelUsing f xs = do
    setNumCapabilities (length xs)
    rs <- asyncMapM f xs
-   return $ mconcat rs
+   return $ either conflict id (foldM mergeResult safe rs)
+  where
+    conflict message = Result (Crash [] message) mempty mempty mempty
+    mergeResult prior next
+      | not (valid prior && valid next) = Left "partition result has inconsistent KVar scope coverage"
+      | not (HS.null (HS.intersection (keys prior) (keys next))) = Left "parallel partitions export the same KVar"
+      | otherwise = Right $ Result
+          (resStatus prior <> resStatus next)
+          (HashMap.union (resSolution prior) (resSolution next))
+          (HashMap.union (resNonCutsSolution prior) (resNonCutsSolution next))
+          (HashMap.union (resScopes prior) (resScopes next))
+    valid result =
+      HS.null (HS.intersection (HashMap.keysSet (resSolution result)) (HashMap.keysSet (resNonCutsSolution result)))
+        && HashMap.keysSet (resScopes result) == keys result
+    keys result = HS.union (HashMap.keysSet (resSolution result)) (HashMap.keysSet (resNonCutsSolution result))
 
 
 --------------------------------------------------------------------------------
@@ -236,7 +251,7 @@ loudDump i cfg si = when False (writeLoud $ msg ++ PJ.render (toFixpoint cfg si)
 
 {-# SCC simplifyFInfo #-}
 simplifyFInfo :: (NFData a, Fixpoint a, Show a, Loc a)
-               => Config -> FInfo a -> IO (ElabParam, SInfo a)
+               => Config -> FInfo a -> IO (ElabParam, SInfo a, SInfo a, SourceScopes)
 simplifyFInfo !cfg !fi0 = do
   -- writeLoud $ "fq file in: \n" ++ render (toFixpoint cfg fi)
   -- rnf fi0 `seq` donePhase Loud "Read Constraints"
@@ -252,12 +267,13 @@ simplifyFInfo !cfg !fi0 = do
   -- writeLoud $ "fq file after sanitize: \n" ++ render (toFixpoint cfg si1)
   -- rnf si1 `seq` donePhase Loud "Validated Constraints"
   graphStatistics cfg si1
-  let si2  = {- SCC "wfcUniqify" -} wfcUniqify $!! si1
+  let (origins, si2) = {- SCC "wfcUniqify" -} wfcUniqify $!! si1
   -- writeLoud $ "fq file after wfcUniqify: \n" ++ render (toFixpoint cfg si2)
   let si3  = {- SCC "renameAll"  -} renameAll  $!! si2
+      sourceScopes = either (die . err dummySpan . PJ.text) id (validateOrigins origins si3)
   rnf si3 `seq` whenLoud $ donePhase Loud "Uniqify & Rename"
   loudDump 1 cfg si3
-  let si4  = {- SCC "defunction" -} defunctionalize cfg $!! si3
+  let si4  = {- SCC "defunction" -} defunctionalize cfg $!! shareFunctionLets cfg si3
   -- writeLoud $ "fq file after defunc: \n" ++ render (toFixpoint cfg si4)
   -- putStrLn $ "AXIOMS: " ++ showpp (asserts si4)
   loudDump 2 cfg si4
@@ -265,12 +281,50 @@ simplifyFInfo !cfg !fi0 = do
       elabParam = ElabParam
                      ef
                      (atLoc dummySpan "solver")
-                     (coerceEnv ef (symbolEnv cfg si4))
+                     (symbolEnv cfg si4)
       si5  = elaborate elabParam si4
   -- writeLoud $ "fq file after elaborate: \n" ++ render (toFixpoint cfg si5)
   loudDump 3 cfg si5
   let si6 = if extensionality cfg then {- SCC "expand" -} expand cfg si5 else si5
-  return (elabParam, si6){- SCC "elaborate" -}
+  return (elabParam, si5, si6, sourceScopes){- SCC "elaborate" -}
+
+validateOrigins :: WfOrigins -> SInfo a -> Either String SourceScopes
+validateOrigins origins fi
+  | HashMap.keysSet origins /= HashMap.keysSet (Types.ws fi) = Left "KVar origin and WF keysets differ"
+  | otherwise = HashMap.traverseWithKey validateOne origins
+  where
+    binders = HashMap.fromList (bindEnvToList (Types.bs fi))
+    validateOne k entries = do
+      w <- maybe (Left "KVar origin has no WF") Right (HashMap.lookup k (Types.ws fi))
+      let binderIds = [i | BindOrigin _ i <- entries]
+          valueIds = [i | ValueOrigin _ i <- entries]
+          wfIds = elemsIBindEnv (wenv w)
+      valueBindings <- traverse lookupOrigin valueIds
+      if wkvar w == k && L.sort [(name, sr_sort sr) | (name, sr, _) <- valueBindings] == L.sort (wvvs w)
+        && length valueIds == HS.size (HS.fromList valueIds)
+        && length binderIds == length wfIds && HS.fromList binderIds == HS.fromList wfIds
+        then Right ()
+        else Left "KVar origins do not cover every WF occurrence exactly once"
+      mapped <- foldM (insertOrigin w) HashMap.empty entries
+      finalBinders <- traverse lookupOrigin wfIds
+      if HashMap.keysSet mapped == HS.fromList (map fst (wvvs w) ++ [name | (name, _, _) <- finalBinders])
+        then Right mapped
+        else Left "KVar origin does not cover the final WF domain"
+    insertOrigin w mapped origin = do
+      (canonical, source) <- case origin of
+        ValueOrigin source i -> do
+          (bound, sr, _) <- lookupOrigin i
+          if (bound, sr_sort sr) `elem` wvvs w then Right (bound, source) else Left "KVar value binder changed without its WF value"
+        BindOrigin source i -> do
+          if memberIBindEnv i (wenv w) then Right () else Left "KVar binder origin left its WF scope"
+          (canonical, _, _) <- lookupOrigin i
+          Right (canonical, source)
+      case HashMap.lookup canonical mapped of
+        Nothing -> Right (HashMap.insert canonical source mapped)
+        Just previous
+          | previous == source -> Right mapped
+          | otherwise -> Left "distinct KVar sources collapsed to one canonical formal"
+    lookupOrigin i = maybe (Left "KVar origin binder is missing") Right (HashMap.lookup i binders)
 
 reduceFInfo :: Fixpoint a => Config -> FInfo a -> IO (FInfo a)
 reduceFInfo cfg fi = do
@@ -284,12 +338,11 @@ reduceFInfo cfg fi = do
     return reducedFi
 
 solveNative' !cfg !fi0 = do
-  (elabParam, si6) <- simplifyFInfo cfg fi0
+  (elabParam, source, si6, sourceScopes) <- simplifyFInfo cfg fi0
   let scope = sInfoScope cfg si6
-  res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si6
-  let res = simplifyResult cfg scope res0
+  res {- SCC "Sol.solve" -} <- Sol.solve cfg source elabParam scope sourceScopes $!! si6
   -- rnf soln `seq` donePhase Loud "Solve2"
-  --let stat = resStatus res
+  -- let stat = resStatus res
   -- saveSolution cfg res
   when (save cfg) $ Sol.saveSolution cfg "" res
   -- writeLoud $ "\nSolution:\n"  ++ showpp (resSolution res)
@@ -334,15 +387,3 @@ parseFI f = do
   return $ mempty { Types.quals = Types.quals  fi
                   , Types.gLits = Types.gLits  fi
                   , Types.dLits = Types.dLits  fi }
-
-simplifyResult :: Config -> HS.HashSet Symbol -> Result a -> Result a
-simplifyResult cfg scope res =
-    res
-      { resSolution = HashMap.map simplifyKVar' (resSolution res)
-      , resNonCutsSolution = HashMap.map (fmap simplifyKVar') (resNonCutsSolution res)
-      }
-  where
-    simplifyKVar' e = unElabSets $ unElab' $ Sol.simplifyKVar scope e
-    sets          = elabSetBag . solverFlags $ cfg
-    unElabSets    = if sets then unElabFSetBagZ3 else id
-    unElab'       = if sortedSolution cfg then id else unElab

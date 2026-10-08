@@ -76,6 +76,7 @@ data Config = Config
   , scrape      :: Scrape              -- ^ configure auto-scraping of qualifiers from constraints
   , elimBound   :: Maybe Int           -- ^ maximum length of KVar chain to eliminate
   , smtTimeout  :: Maybe Int           -- ^ smt timeout in msec
+  , smtMbqi     :: Bool                -- ^ enable model-based quantifier instantiation at startup
   , elimStats   :: Bool                -- ^ print eliminate stats
   , solverStats :: Bool                -- ^ print solver stats
   , metadata    :: Bool                -- ^ print meta-data associated with constraints
@@ -223,6 +224,7 @@ defConfig = Config
   , scrape             = No
   , elimBound          = Nothing
   , smtTimeout         = Nothing
+  , smtMbqi            = False
   , elimStats          = False
   , solverStats        = False
   , save               = False
@@ -307,6 +309,8 @@ fxOptions =
       "(alpha) Maximum eliminate-chain depth"
   , Option [] ["smtTimeout"]       (ReqArg (\s -> FxMod $ \c -> c { smtTimeout  = parseInt "smtTimeout" s }) "N")
       "SMT timeout in msec"
+  , opt0 "mbqi"                    (\c -> c { smtMbqi       = True })
+      "Enable model-based quantifier instantiation (Z3 or CVC5)"
   , opt0 "elim-stats"              (\c -> c { elimStats     = True })
       "(alpha) Print eliminate stats"
   , opt0 "solver-stats"            (\c -> c { solverStats   = True })

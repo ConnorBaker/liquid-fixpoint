@@ -3,6 +3,7 @@
 
 module Language.Fixpoint.Horn.Info (
     hornFInfo
+  , scrapeFInfo
   ) where
 
 import           Data.Ord (Down(..), comparing)
@@ -11,10 +12,12 @@ import qualified Data.HashSet                   as S
 import qualified Data.List                      as L
 import qualified Data.Tuple                     as Tuple
 import           GHC.Generics                   (Generic)
+import qualified Language.Fixpoint.SortCheck    as SortCheck
 import qualified Language.Fixpoint.Misc         as Misc
 import qualified Language.Fixpoint.Types        as F
 import qualified Language.Fixpoint.Types.Config as F
 import qualified Language.Fixpoint.Horn.Types   as H
+import qualified Language.Fixpoint.Types.Visitor as V
 import qualified Data.Maybe                     as Mb
 
 hornFInfo :: (F.Fixpoint a, F.PPrint a) => F.Config -> H.Query a -> F.FInfo a
@@ -160,7 +163,67 @@ hvarArg k i = F.hvarArgSymbol (H.hvName k) i
 
 -------------------------------------------------------------------------------
 -- | Automatically scrape qualifiers from all predicates in a constraint
+
 -------------------------------------------------------------------------------
+
+-- Reuse the Horn qualifier language for ordinary subtyping constraints.
+-- These expressions supply candidates only; their original polarity and
+-- proof obligations remain unchanged in the FInfo passed to the solver.
+-- A candidate depends only on its predicate's free declarations. Project each
+-- constraint's scope onto that support, preserving lhs shadowing and the Horn
+-- scraper's cyclic parameter order without rebuilding the complete scope.
+scrapeFInfo :: F.Config -> F.Scrape -> F.FInfo a -> [F.Qualifier]
+scrapeFInfo _ F.No _ = []
+scrapeFInfo cfg mode info = Misc.sortNub $ filter closed $ concatMap (uncurry mkQualParams) inputs
+  where
+    inputs = S.toList $ S.fromList $ concatMap scrapeSub constraints ++ environmentInputs
+    constraints = M.elems (F.cm info)
+    -- Environment facts depend on their scope and the lhs declaration, not
+    -- the constraint's own predicates. Share only that exact judgment.
+    contexts = S.toList $ S.fromList $ map context constraints
+    environmentInputs = case mode of
+        F.Both -> concatMap scrapeScope contexts
+        _ -> []
+    bindings = F.beBinds (F.bs info)
+    -- envCs restricts this enumeration without reordering it. Reversing each
+    -- name's declarations retains its last in-scope binding, including duplicates.
+    declarations = M.fromListWith (++) [(name, [(i, sort)]) | (i, (name, F.RR sort _, _)) <- M.toList bindings]
+    facts = fmap (\(name, reft, _) -> candidates (predicateAt name reft)) bindings
+    candidates e = [(p, S.toList (F.syms p)) | p <- scrapeConjuncts e, V.isConc p]
+    -- Inference candidates may mention only their parameters and this query's
+    -- globals. Predicates from a local environment can outlive a local symbol
+    -- in the raw BindEnv; they are not new globally scoped declarations.
+    closed = all (`F.memberSEnv` globals) . F.syms
+    globals = SortCheck.globalEnv cfg info
+    context sub = (F.senv sub, value, sort)
+      where
+        F.RR sort (F.Reft (value, _)) = F.slhs sub
+    scrapeSub sub = project (context sub) predicates
+      where
+        lhs@(F.RR _ (F.Reft (value, _))) = F.slhs sub
+        predicates =
+            candidates (predicateAt value (F.srhs sub)) ++ case mode of
+                F.Both -> candidates (predicateAt value lhs)
+                _ -> []
+    scrapeScope scope@(bindingsInScope, _, _) =
+        project
+            scope
+            (concat [ps | i <- F.elemsIBindEnv bindingsInScope, Just ps <- [M.lookup i facts]])
+    project (scope, value, sort) predicates =
+        [ (L.sortOn (\(x, _) -> Down (x == value, x)) xts, p)
+        | (p, names) <- predicates
+        , let xts = parameters names
+        , not (null xts)
+        , length xts <= maxQualifierParams
+        ]
+      where
+        -- shiftCycle emits nothing at these rejected arities. Admit only its
+        -- productive inputs before sorting parameters or hashing predicates.
+        parameters names = take (maxQualifierParams + 1) [(x, t) | x <- names, Just t <- [lookupSort x]]
+        lookupSort x
+            | x == value = Just sort
+            | otherwise = Mb.listToMaybe [t | (i, t) <- M.lookupDefault [] x declarations, F.memberIBindEnv i scope]
+    predicateAt name (F.RR _ (F.Reft (value, predicate))) = F.subst1 predicate (value, F.EVar name)
 
 scrapeCstr :: F.Scrape -> H.Cstr a -> [F.Qualifier]
 scrapeCstr F.No _    = []
@@ -177,13 +240,29 @@ scrapeBind _      _    _ = []
 scrapePred :: BindEnv -> H.Pred -> [F.Qualifier]
 scrapePred _    (H.Var _ _) = []
 scrapePred senv (H.PAnd ps) = concatMap (scrapePred senv) ps
-scrapePred senv (H.Reft e)  = concatMap (mkQual senv) (F.concConjuncts e)
+scrapePred senv (H.Reft e)  = concatMap (mkQual senv) (scrapeConjuncts e)
+
+-- Retain original templates: their first parameter anchors instantiation.
+-- In total Boolean logic, ite p q false also supplies the conjuncts of p and q.
+scrapeConjuncts :: F.Expr -> [F.Expr]
+scrapeConjuncts = concatMap candidates . F.concConjuncts
+  where
+    candidates e@(F.EIte p q F.PFalse) = e : conjuncts p ++ conjuncts q
+    candidates e = [e]
+    conjuncts (F.PAnd ps) = concatMap conjuncts ps
+    conjuncts (F.EIte p q F.PFalse) = conjuncts p ++ conjuncts q
+    conjuncts e = F.concConjuncts e
 
 -- NOTE: Constraints.mkQual will do extra stuff like generalizing the sorts...
-mkQual :: BindEnv -> F.Expr -> [ F.Qualifier ]
-mkQual env e = [ mkScrapeQual xts' e | xts' <- shiftCycle xts ]
-  where
-    xts = qualParams env e
+mkQual :: BindEnv -> F.Expr -> [F.Qualifier]
+mkQual env e = mkQualParams (qualParams env e) e
+
+mkQualParams :: [(F.Symbol, F.Sort)] -> F.Expr -> [F.Qualifier]
+mkQualParams xts e
+  -- Qualifiers are fixed predicates, not definitions of the unknowns whose
+  -- source constraints we are mining. Leave those constraints untouched.
+  | V.isConc e = [mkScrapeQual xts' e | xts' <- shiftCycle xts]
+  | otherwise = []
 
 mkScrapeQual :: [(F.Symbol, F.Sort)] -> F.Expr -> F.Qualifier
 mkScrapeQual xts e = F.mkQual (F.symbol "AUTO") qParams body (F.dummyPos "")

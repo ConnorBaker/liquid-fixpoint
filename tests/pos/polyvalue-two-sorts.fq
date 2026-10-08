@@ -1,0 +1,25 @@
+// One ordinary nullary family, three independently typed occurrences.
+data Token 0 = [ | First {} | Second {} ]
+constant family : func(1, [Set_Set @(0)])
+
+bind 0 tokens : {v : Set_Set Token | v = family}
+bind 1 ints : {v : Set_Set int | v = family}
+bind 2 generic : {v : Set_Set a | v = family}
+
+constraint:
+  env [0; 1; 2]
+  lhs {v : Set_Set Token | v = family}
+  rhs {v : Set_Set Token | v = tokens}
+  id 0 tag []
+
+constraint:
+  env [0; 1; 2]
+  lhs {v : Set_Set int | v = family}
+  rhs {v : Set_Set int | v = ints}
+  id 1 tag []
+
+constraint:
+  env [0; 1; 2]
+  lhs {v : Set_Set a | v = family}
+  rhs {v : Set_Set a | v = generic}
+  id 2 tag []

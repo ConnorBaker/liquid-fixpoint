@@ -1,0 +1,9 @@
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+bind 0 token : {v : Token | v = undef}
+
+constraint:
+  env [0]
+  lhs {v : Token | v = token}
+  rhs {v : Token | v = undef}
+  id 0 tag []

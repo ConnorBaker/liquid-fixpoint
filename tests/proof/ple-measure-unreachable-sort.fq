@@ -1,0 +1,16 @@
+fixpoint "--rewrite"
+
+data Token 0 = [ | First {} ]
+constant choose : func(0, [Token; int])
+
+// The Boolean branch is unreachable. Checking both branches before selecting
+// the valid guard would suppress the measure unfolding and lose this proof.
+match choose First { if (0 == 0) then 11 else true }
+
+constraint:
+  env []
+  lhs {v : int | true}
+  rhs {v : int | choose First == 11}
+  id 1 tag []
+
+expand [1 : True]

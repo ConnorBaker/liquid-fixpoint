@@ -23,7 +23,7 @@ statistics _ fi = do
   let fis = partition' Nothing fi
   putStrLn $ render $ pprint $ partitionStats fis
   donePhase Loud "Statistics"
-  return mempty
+  return F.safe
 
 partitionStats :: [F.FInfo a] -> Maybe Stats
 partitionStats fis = info
