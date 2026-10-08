@@ -2,6 +2,7 @@
 --   1. Each binder must be associated with a UNIQUE sort
 {-# LANGUAGE TupleSections     #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Language.Fixpoint.Solver.Sanitize
   ( -- * Transform FInfo to enforce invariants
@@ -9,6 +10,7 @@ module Language.Fixpoint.Solver.Sanitize
 
     -- * Sorts for each Symbol (move elsewhere)
   , symbolEnv
+  , shareFunctionLets
 
     -- * Remove substitutions K[x := e] where `x` is not in dom(K)
   , dropDeadSubsts
@@ -16,12 +18,12 @@ module Language.Fixpoint.Solver.Sanitize
 
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Visitor
-import           Language.Fixpoint.SortCheck     (ElabParam(..), theoryEnv, elaborate, applySorts, isFirstOrder)
+import           Language.Fixpoint.SortCheck     (theoryEnv, isFirstOrder)
 -- import           Language.Fixpoint.Defunctionalize
 import           Language.Fixpoint.Misc ((==>))
 import qualified Language.Fixpoint.Misc                            as Misc
 import qualified Language.Fixpoint.Types                           as F
-import           Language.Fixpoint.Types.Config (Config, solverFlags)
+import           Language.Fixpoint.Types.Config (Config)
 import qualified Language.Fixpoint.Types.Config as Cfg
 import qualified Language.Fixpoint.Types.Errors                    as E
 import qualified Language.Fixpoint.Smt.Theories                    as Thy
@@ -33,25 +35,121 @@ import qualified Data.List                                         as L
 import qualified Data.Text                                         as T
 import           Data.Maybe          (isNothing, mapMaybe, fromMaybe)
 import           Control.Monad       ((>=>))
+import qualified Control.Monad.State.Strict as St
 import           GHC.Stack           (HasCallStack)
 import           Text.PrettyPrint.HughesPJ hiding ((<>))
 import qualified Language.Fixpoint.SortCheck as SortCheck
 
 type SanitizeM a = Either E.Error a
 
+-- Lift lexical, nonrecursive function lets into the existing defined-function
+-- boundary before beta normalization. Their free terms become explicit typed
+-- parameters; annotation ownership remains the original query declaration scope.
+-- Unknown-dependent authored closures retain the ordinary interpretation path.
+shareFunctionLets :: Config -> F.SInfo a -> F.SInfo a
+shareFunctionLets cfg info = result{F.defns = F.defns info <> F.MkDefinedFuns (reverse definitions)}
+  where
+    (result, (_, _, definitions)) = St.runState transform (F.tempSymbol "lexical_definition" (0 :: Integer), occupied, [])
+    original = symbolEnv cfg info
+    declarations = F.seSort original
+    fixed = S.fromList (map fst (F.toListSEnv (SortCheck.globalEnv cfg info <> F.dLits info)))
+    expressions = [F.reftPred (F.sr_reft refinement) | (_, (_, refinement, _)) <- F.bindEnvToList (F.bs info)] ++ map F.crhs (M.elems (F.cm info)) ++ concatMap assertionExpressions (F.asserts info)
+    assertionExpressions (F.TR (F.Patterns patterns) predicate) = predicate : concat patterns
+    F.MkDefinedFuns existing = F.defns info
+    occupied = S.fromList (map fst (F.toListSEnv declarations)) <> S.unions (map F.sortSymbols (map snd (F.toListSEnv declarations)) ++ map names expressions ++ map equationNames (existing ++ F.aenvEqs (F.ae info)))
+    equationNames equation = S.fromList (F.eqName equation : map fst (F.eqArgs equation)) <> names (F.eqBody equation) <> S.unions (map F.sortSymbols (F.eqSort equation : map snd (F.eqArgs equation)))
+    -- Global definition owners reserve free terms and free sort coordinates;
+    -- scoped substitution protects unrelated nested lexical binders.
+    names expression = F.syms expression <> exprFreeSortNames expression
+    close = F.resolveNumericSort (`F.lookupSEnv` declarations)
+    bind bindings locals = F.fromListSEnv [(name, (close sort, True)) | (name, sort) <- bindings] <> locals
+    initial = F.fromListSEnv [(name, (close sort, True)) | (name, sort) <- F.toListSEnv declarations, not (S.member name fixed)]
+    transform = do
+        bindings <-
+            traverse
+                ( \(index, (name, refinement, annotation)) -> do
+                    predicate <- walk (bind [(F.reftBind (F.sr_reft refinement), F.sr_sort refinement)] initial) (F.reftPred (F.sr_reft refinement))
+                    pure (index, (name, refinement{F.sr_reft = F.Reft (F.reftBind (F.sr_reft refinement), predicate)}, annotation))
+                )
+                (F.bindEnvToList (F.bs info))
+        constraints <-
+            traverse
+                ( \constraint -> do
+                    predicate <- walk initial (F.crhs constraint)
+                    pure constraint{F._crhs = predicate}
+                )
+                (F.cm info)
+        assertions <- traverse (\(F.TR (F.Patterns patterns) predicate) -> F.TR <$> (F.Patterns <$> traverse (traverse (walk initial)) patterns) <*> walk initial predicate) (F.asserts info)
+        pure info{F.bs = (F.bs info){F.beBinds = M.fromList bindings}, F.cm = constraints, F.asserts = assertions}
+    walk locals (F.ELet name rhs body) = do
+        rhs' <- walk locals rhs
+        (previous, used, equations) <- St.get
+        let defined = F.MkDefinedFuns (reverse equations)
+            theory = Thy.theorySymbols defined <> F.seTheory original
+            owned = (F.tsSort <$> theory) <> declarations
+            environment = original{F.seTheory = theory, F.seSort = owned}
+            (parameters, predicate) = lambdas rhs'
+            generated = S.fromList (map F.eqName equations)
+            globals = fixed `S.difference` S.fromList (map fst (F.toListSEnv locals))
+            free = F.syms predicate `S.difference` S.fromList (map fst parameters) `S.difference` globals `S.difference` generated
+            captures = [(variable, sort) | variable <- L.sort (S.toList free), Just (sort, _) <- [F.lookupSEnv variable locals]]
+            safe = null (kvarsExpr rhs') && all (\variable -> maybe False snd (F.lookupSEnv variable locals)) (S.toList free)
+        if not (null parameters) && safe && length captures == S.size free
+            then do
+                let checked = either E.die id (SortCheck.elabExprEAt (Cfg.solverFlags cfg) environment (fst <$> locals) "lexical definition" Nothing rhs')
+                    (arguments, checkedBody) = lambdas checked
+                    resultSort = SortCheck.exprSort "lexical definition result" checkedBody
+                    (reserved, fresh) = F.freshInNS previous used
+                    equation = F.mkEquation fresh (captures ++ arguments) checkedBody (close resultSort)
+                    replacement = F.eApps (F.EVar fresh) [F.EVar variable | (variable, _) <- captures]
+                St.put (fresh, reserved, equation : equations)
+                walk locals (F.subst1 body (name, replacement))
+            else do
+                let sort = either (const Nothing) Just (SortCheck.sortExprE (Just environment) F.dummySpan owned (fst <$> locals) rhs')
+                    independent = null (kvarsExpr rhs') && all (\variable -> maybe True snd (F.lookupSEnv variable locals)) (S.toList (F.syms rhs'))
+                    inside = maybe (F.deleteSEnv name locals) (\value -> F.insertSEnv name (close value, independent) locals) sort
+                F.ELet name rhs' <$> walk inside body
+    walk locals (F.PAll bindings body) = F.PAll bindings <$> walk (bind bindings locals) body
+    walk locals (F.PExist bindings body) = F.PExist bindings <$> walk (bind bindings locals) body
+    walk locals (F.ELam binding body) = F.ELam binding <$> walk (bind [binding] locals) body
+    walk locals expression = descend locals expression
+    descend locals (F.EApp function argument) = F.EApp <$> walk locals function <*> walk locals argument
+    descend locals (F.ENeg value) = F.ENeg <$> walk locals value
+    descend locals (F.EBin operator left right) = F.EBin operator <$> walk locals left <*> walk locals right
+    descend locals (F.EIte condition yes no) = F.EIte <$> walk locals condition <*> walk locals yes <*> walk locals no
+    descend locals (F.ECst value sort) = (`F.ECst` sort) <$> walk locals value
+    descend locals (F.PAnd values) = F.PAnd <$> traverse (walk locals) values
+    descend locals (F.POr values) = F.POr <$> traverse (walk locals) values
+    descend locals (F.PNot value) = F.PNot <$> walk locals value
+    descend locals (F.PImp left right) = F.PImp <$> walk locals left <*> walk locals right
+    descend locals (F.PIff left right) = F.PIff <$> walk locals left <*> walk locals right
+    descend locals (F.PAtom relation left right) = F.PAtom relation <$> walk locals left <*> walk locals right
+    descend locals (F.ECoerc source target value) = F.ECoerc source target <$> walk locals value
+    -- Type abstraction cannot escape its lexical coordinate scope.
+    descend _ value@F.ETAbs{} = pure value
+    descend locals (F.ETApp value sort) = (`F.ETApp` sort) <$> walk locals value
+    descend locals (F.PKVar variable types actuals) = do
+        values <- traverse (walk locals) (F.fromKVarSubst actuals)
+        pure (F.PKVar variable types (F.toKVarSubst values))
+    descend _ value = pure value
+    lambdas (F.ELam binding body) = let (bindings, predicate) = lambdas body in (binding : bindings, predicate)
+    lambdas (F.ECst body _) | F.ELam{} <- F.dropECst body = lambdas body
+    lambdas expression = ([], expression)
+
 --------------------------------------------------------------------------------
 sanitize :: (Show a) => Config -> F.SInfo a -> SanitizeM (F.SInfo a)
 --------------------------------------------------------------------------------
-sanitize cfg =       banIrregularData
-         >=> Misc.fM dropFuncSortedShadowedBinders
-         >=> Misc.fM sanitizeWfC
-         >=> Misc.fM replaceDeadKvars
-         >=> Misc.fM (dropDeadSubsts . restrictKVarDomain cfg)
-         >=>         banMixedRhs
-         >=>         banQualifFreeVars cfg
-         >=>         banConstraintFreeVars cfg
-         >=> Misc.fM addLiterals
-         >=> Misc.fM (eliminateEta cfg)
+sanitize cfg =
+    banIrregularData
+        >=> Misc.fM dropFuncSortedShadowedBinders
+        >=> Misc.fM sanitizeWfC
+        >=> Misc.fM replaceDeadKvars
+        >=> Misc.fM (dropDeadSubsts . restrictKVarDomain cfg)
+        >=> banMixedRhs
+        >=> checkQualifiers cfg
+        >=> banConstraintFreeVars cfg
+        >=> Misc.fM addLiterals
+        >=> Misc.fM (eliminateEta cfg)
 
 --------------------------------------------------------------------------------
 -- | 'dropAdtMeasures' removes all the measure definitions that correspond to
@@ -206,7 +304,7 @@ restrictKVarDomain cfg si
   | Cfg.explicitKvars cfg = si
   | otherwise             = si { F.ws = M.mapWithKey (restrictWf kvm) (F.ws si) }
   where
-    kvm                   = safeKvarEnv si
+    kvm                   = safeKvarEnv cfg si
 
 -- | `restrictWf kve k w` restricts the env of `w` to the parameters in `kve k`.
 restrictWf :: KvDom -> F.KVar -> F.WfC a -> F.WfC a
@@ -224,48 +322,46 @@ type KvBads    = M.HashMap F.KVar [F.Symbol]
 --   `x` which appear in substitutions of the form `K[x := y]`
 --   where `y` is not in the env.
 
-safeKvarEnv :: F.SInfo a -> KvDom
-safeKvarEnv si = L.foldl' (dropKvarEnv si) env0 cs
-  where
-    cs         = M.elems  (F.cm si)
-    env0       = initKvarEnv si
+safeKvarEnv :: Config -> F.SInfo a -> KvDom
+safeKvarEnv cfg si = L.foldl' (dropKvarEnv cfg si) env0 cs
+ where
+  cs = M.elems (F.cm si)
+  env0 = initKvarEnv si
 
-
-dropKvarEnv :: F.SInfo a -> KvDom -> F.SimpC a -> KvDom
-dropKvarEnv si kve c = M.mapWithKey (dropBadParams kBads) kve
-  where
-    kBads            = badParams si c
+dropKvarEnv :: Config -> F.SInfo a -> KvDom -> F.SimpC a -> KvDom
+dropKvarEnv cfg si kve c = M.mapWithKey (dropBadParams kBads) kve
+ where
+  kBads = badParams cfg si c
 
 dropBadParams :: KvBads -> F.KVar -> F.SEnv F.BindId -> F.SEnv F.BindId
 dropBadParams kBads k kEnv = L.foldl' (flip F.deleteSEnv) kEnv xs
-  where
-    xs                     = M.lookupDefault mempty k kBads
+ where
+  xs = M.lookupDefault mempty k kBads
 
-badParams :: F.SInfo a -> F.SimpC a -> M.HashMap F.KVar [F.Symbol]
-badParams si c = Misc.group bads
-  where
-    bads       = [ (k, x) | (v, k, su) <- subcKSubs xsrs c
-                          , let vEnv = maybe sEnv (`S.insert` sEnv) v
-                          , (x, e)          <- M.toList (F.fromKVarSubst su)
-                          , badArg vEnv e
-                 ]
-    sEnv       = S.fromList (fst <$> xsrs)
-    xsrs       = F.envCs (F.bs si) (F.senv c)
+badParams :: Config -> F.SInfo a -> F.SimpC a -> M.HashMap F.KVar [F.Symbol]
+badParams cfg si c = Misc.group bads
+ where
+  bads =
+    [ (k, x)
+    | (v, k, su) <- subcKSubs xsrs c
+    , let vEnv = maybe sEnv (`S.insert` sEnv) v
+    , (x, e) <- M.toList (F.fromKVarSubst su)
+    , badArg vEnv e
+    ]
+  sEnv = S.fromList (map fst xsrs ++ map fst (F.toListSEnv (SortCheck.globalEnv cfg si)))
+  xsrs = F.envCs (F.bs si) (F.senv c)
 
 badArg :: S.HashSet F.Symbol -> F.Expr -> Bool
-badArg sEnv (F.EVar y) = not (y `S.member` sEnv)
-badArg _    _          = True
+badArg sEnv e = not (F.syms e `S.isSubsetOf` sEnv)
 
 type KSub = (Maybe F.Symbol, F.KVar, F.KVarSubst F.Symbol F.Symbol)
 
 subcKSubs :: [(F.Symbol, F.SortedReft)] -> F.SimpC a -> [KSub]
 subcKSubs xsrs c = rhs ++ lhs
-  where
-    lhs          = [ (Just v, k, su) | (_, sr) <- xsrs
-                                     , let rs   = F.reftConjuncts (F.sr_reft sr)
-                                     , F.Reft (v, F.PKVar k _ su) <- rs
-                   ]
-    rhs          = [(Nothing, k, su) | F.PKVar k _ su <- [F.crhs c]]
+ where
+  lhs = concat [occurrences (Just v) p | (_, F.RR _ (F.Reft (v, p))) <- xsrs]
+  rhs = occurrences Nothing (F.crhs c)
+  occurrences v e = [(v, k, su) | (k, sus) <- M.toList (F.exprKVars e), su <- sus]
 
 
 initKvarEnv :: F.SInfo a -> KvDom
@@ -320,18 +416,24 @@ badDataDecl :: Misc.ListNE F.DataDecl -> E.Error
 badDataDecl ds = E.catErrors [ E.errBadDataDecl d | d <- ds ]
 
 --------------------------------------------------------------------------------
--- | check that no qualifier has free variables
+-- | Qualifiers are concrete predicates over their parameters and globals.
+-- Unlike automatically mined candidates, malformed declarations are errors.
 --------------------------------------------------------------------------------
-banQualifFreeVars :: Config -> F.SInfo a -> SanitizeM (F.SInfo a)
+checkQualifiers :: Config -> F.SInfo a -> SanitizeM (F.SInfo a)
 --------------------------------------------------------------------------------
-banQualifFreeVars cfg fi = Misc.applyNonNull (Right fi) (Left . badQuals) bads
-  where
-    bads    = [ (q, xs) | q <- F.quals fi, let xs = free q, not (S.null xs) ]
-    free q  = S.filter (not . isGlobal) (F.syms q)
-    isGlobal x = F.memberSEnv x (SortCheck.globalEnv cfg fi)
-
-badQuals     :: Misc.ListNE (F.Qualifier, S.HashSet F.Symbol) -> E.Error
-badQuals bqs = E.catErrors [ E.errFreeVarInQual q xs | (q, xs) <- bqs]
+checkQualifiers cfg fi = Misc.applyNonNull (Right fi) (Left . E.catErrors) bads
+ where
+  bads =
+    concat
+      [ [ E.err (F.srcSpan q) (vcat ["Qualifier contains unknown predicates", pprint q, pprint ks])
+        | let ks = M.keys (F.exprKVars (F.qBody q))
+        , not (null ks)
+        ]
+          ++ [E.errFreeVarInQual q xs | let xs = free q, not (S.null xs)]
+      | q <- F.quals fi
+      ]
+  free q = S.filter (not . isGlobal) (F.syms q)
+  isGlobal x = F.memberSEnv x (SortCheck.globalEnv cfg fi)
 
 
 --------------------------------------------------------------------------------
@@ -356,21 +458,13 @@ badRhs1 (i, c) = E.err E.dummySpan $ vcat [ "Malformed RHS for constraint id" <+
 -- | symbol |-> sort for EVERY variable in the SInfo; 'symbolEnv' can ONLY be
 --   called with **sanitized** environments (post the uniqification etc.) or
 --   else you get duplicate sorts and other such errors.
---   We do this peculiar dance with `env0` to extract the apply-sorts from the
---   function definitions inside the `AxiomEnv` which cannot be elaborated as
---   it makes it hard to actually find the fundefs within (breaking PLE.)
 --------------------------------------------------------------------------------
 symbolEnv :: HasCallStack => Config -> F.SInfo a -> F.SymEnv
-symbolEnv cfg si = F.symEnv cfg sEnv thyEnv ds lits (ts ++ ts')
+symbolEnv cfg si = F.symEnv cfg sEnv thyEnv ds lits
   where
-    ts'          = applySorts ae'
-    ae'          = elaborate (ElabParam ef (F.atLoc E.dummySpan "symbolEnv") env0) (F.ae si)
-    env0         = F.symEnv cfg sEnv thyEnv ds lits ts
     thyEnv       = theoryEnv cfg si
     ds           = F.ddecls si
-    ts           = Misc.setNub (applySorts si ++ [t | (_, t) <- F.toListSEnv sEnv])
-    sEnv         = F.coerceSortEnv ef $ (F.tsSort <$> thyEnv) `mappend` F.fromListSEnv xts
-    ef           = solverFlags cfg
+    sEnv         = (F.tsSort <$> thyEnv) `mappend` F.fromListSEnv xts
     xts          = symbolSorts cfg si ++ alits
     lits         = F.dLits si `F.unionSEnv'` F.fromListSEnv alits
     alits        = litsAEnv $ F.ae si

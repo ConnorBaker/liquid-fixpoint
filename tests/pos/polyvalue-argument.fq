@@ -1,0 +1,10 @@
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+constant consume : func(0, [Token; int])
+bind 0 result : {v : int | v = consume undef && v >= 0}
+
+constraint:
+  env [0]
+  lhs {v : int | v = result}
+  rhs {v : int | v >= 0}
+  id 0 tag []

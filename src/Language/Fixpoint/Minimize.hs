@@ -73,7 +73,7 @@ commonDebug init updateFi checkRes min cfg solve fi ext formatter = do
   let minFi = updateFi fi cs
   saveQuery (addExt ext cfg) minFi
   putStrLn $ formatter fi cs
-  return mempty
+  return safe
 
 ---------------------------------------------------------------------------
 minQuery :: (NFData a, Fixpoint a) => Config -> Solver a -> FInfo a

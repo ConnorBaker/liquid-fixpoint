@@ -51,14 +51,15 @@ module Language.Fixpoint.Smt.Theories
      -- * CVC5 finite fields
      , ffVal, ffAdd, ffMul
 
-      -- * Query Theories
+     -- * Query Theories
      , isSmt2App
+     , thyAppInfo
      , axiomLiterals
      , maxLamArg
      ) where
 
 import           Prelude hiding (map)
-import           Control.Monad.State
+import           Control.Monad (guard)
 import           Data.ByteString.Builder (Builder)
 import           Language.Fixpoint.Types.Sorts
 import           Language.Fixpoint.Types.Config
@@ -270,11 +271,11 @@ solverPreamble :: Config -> [Preamble]
 solverPreamble cfg
   =  [ (SOnly [Z3, Z3mem],  "(set-option :auto-config false)")
      , (SOnly [Z3, Z3mem],  "(set-option :model true)")
+     , (SOnly [Cvc4, Cvc5, Mathsat], "(set-option :produce-models true)")
      , (SOnly [Cvc4],       "(set-logic ALL_SUPPORTED)")
      , (SOnly [Cvc5],       "(set-logic ALL)")
      , (SOnly [Cvc4, Cvc5], "(set-option :incremental true)")
      ]
-  ++ setPreamble cfg
   ++ boolPreamble cfg
   ++ arithPreamble cfg
   ++ stringPreamble cfg
@@ -283,11 +284,6 @@ type Preamble = (PreambleCondition, Builder)
 
 data PreambleCondition = SAll | SOnly [SMTSolver]
   deriving (Eq, Show)
-
-setPreamble :: Config -> [Preamble]
--- Z3 does not support cardinality on sets, which is defined to be uninterpreted function
-setPreamble _
-  = [ (SOnly [Z3, Z3mem],  bFun' "set.card" ["(Array Int Bool)"] "Int") ]
 
 boolPreamble :: Config -> [Preamble]
 boolPreamble _
@@ -300,25 +296,33 @@ arithPreamble cfg = (SAll,) <$>
  ]
 
 stringPreamble :: Config -> [Preamble]
-stringPreamble cfg | not (noStringTheory cfg)
-  = [ (SAll, bSort string "String")
-    , (SAll, bFun strLen [("s", fromText string)] "Int" (key (fromText smtlibStrLen) "s"))
-    , (SAll, bFun strSubstr [("s", fromText string), ("i", "Int"), ("j", "Int")] (fromText string) (key (fromText smtlibStrSubstr) "s i j"))
-    , (SAll, bFun strConcat [("x", fromText string), ("y", fromText string)] (fromText string) (key (fromText smtlibStrConcat) "x y"))
-    ]
+stringPreamble cfg
+  | not (noStringTheory cfg) =
+      [ (SAll, bSort string "String")
+      , (SAll, bFun strLen [("s", fromText string)] "Int" (key (fromText smtlibStrLen) "s"))
+      , (SAll, bFun strSubstr [("s", fromText string), ("i", "Int"), ("j", "Int")] (fromText string) (key (fromText smtlibStrSubstr) "s i j"))
+      , (SAll, bFun strConcat [("x", fromText string), ("y", fromText string)] (fromText string) (key (fromText smtlibStrConcat) "x y"))
+      ]
+        ++ [(SAll, bFun name [("x", fromText string), ("y", fromText string)] "Bool" (key (fromText native) "x y")) | (name, native) <- stringComparisons]
+stringPreamble _ =
+  [ (SAll, bSort string "Int")
+  , (SAll, bFun' strLen [fromText string] "Int")
+  , (SAll, bFun' strSubstr [fromText string, "Int", "Int"] (fromText string))
+  , (SAll, bFun' strConcat [fromText string, fromText string] (fromText string))
+  ]
+    ++ [(SAll, bFun' name [fromText string, fromText string] "Bool") | (name, _) <- stringComparisons]
 
-stringPreamble _
-  = [ (SAll, bSort string "Int")
-    , (SAll, bFun' strLen [fromText string] "Int")
-    , (SAll, bFun' strSubstr [fromText string, "Int", "Int"] (fromText string))
-    , (SAll, bFun' strConcat [fromText string, fromText string] (fromText string))
-    ]
+stringComparisons :: [(Raw, Raw)]
+stringComparisons = [(strPrefixOf, smtlibStrPrefixOf), (strSuffixOf, smtlibStrSuffixOf), (strContains, smtlibStrContains)]
 
 --------------------------------------------------------------------------------
 -- | Exported API --------------------------------------------------------------
 --------------------------------------------------------------------------------
 smt2Symbol :: SymEnv -> Symbol -> Maybe Builder
-smt2Symbol env x = fromText . tsRaw <$> symEnvTheory x env
+smt2Symbol env x = do
+  declaration <- symEnvTheory x env
+  guard (tsInterp declaration /= Uninterp)
+  pure (fromText (tsRaw declaration))
 
 instance SMTLIB2 SmtSort where
   smt2 s = pure $ smt2SmtSort s
@@ -342,47 +346,68 @@ smt2SmtSort (SData c ts) = parenSeqs [symbolBuilder c, smt2SmtSorts ts]
 smt2SmtSorts :: [SmtSort] -> Builder
 smt2SmtSorts = seqs . fmap smt2SmtSort
 
-type VarAs = Symbol -> Sort -> SymM Builder
 --------------------------------------------------------------------------------
-smt2App :: VarAs -> Expr -> [Builder] -> SymM (Maybe Builder)
+-- Ownership and the selected occurrence sort are resolved by the caller.
+-- Rendering depends on the configured SMT meaning, never source spelling.
+smt2App :: SymEnv -> TheorySymbol -> Sort -> [Builder] -> Builder
 --------------------------------------------------------------------------------
-smt2App _ ex@(dropECst -> EVar f) [d]
-  | f == arrConstS || f == arrConstB || f == arrConstM =
-      do env <- get
-         pure $ Just $ key (key "as const" (getTarget env ex)) d
-  | f == setEmpty  =
-      do env <- get
-         pure $ Just $ key "as set.empty" (getTarget env ex)
-  | f == bagEmpty  =
-      do env <- get
-         pure $ Just $ key "as bag.empty" (getTarget env ex)
-  | f == ffVal  =
-      do env <- get
-         pure $ Just $ key ("as ff" <> d) (getTarget env ex)
+smt2App env declaration selected arguments =
+    case smt2ArrayApp env declaration selected arguments of
+        Just result -> result
+        Nothing -> case (tsInterp declaration, tsRaw declaration, arguments) of
+            (Theory, "const", [value]) -> key (key "as const" (resultSort True)) value
+            (Theory, "set.empty", [_]) -> key "as set.empty" (resultSort True)
+            (Theory, "bag.empty", [_]) -> key "as bag.empty" (resultSort True)
+            (Theory, "FF_val", [value]) -> key ("as ff" <> value) (resultSort True)
+            _ -> key function (seqs arguments)
   where
-    getTarget :: SymEnv -> Expr -> Builder
-    -- const is a function, but SMT expects only the output sort
-    getTarget env (ECst _ t) = smt2SmtSort $ sortSmtSort True (seData env) (ffuncOut t)
-    getTarget _ e = bShow e
+    resultSort poly = smt2SmtSort (sortSmtSort poly env (ffuncOut selected))
+    function
+        | tsInterp declaration == Ctor
+        , isPolyInst (tsSort declaration) selected =
+            key2 "as" (fromText (tsRaw declaration)) (resultSort False)
+        | otherwise = fromText (tsRaw declaration)
 
-smt2App k ex (builder:builders) =
-  do a <- smt2AppArg k ex
-     pure $ (\fb -> key fb (builder <> mconcat [ " " <> d | d <- builders])) <$> a
-smt2App _ _ [] = pure Nothing
-
-smt2AppArg :: VarAs -> Expr -> SymM (Maybe Builder)
-smt2AppArg k (ECst (dropECst -> EVar f) t)
-  = do env <- get
-       case symEnvTheory f env of
-         Just fThy -> if isPolyCtor fThy t
-                           then Just <$> k f (ffuncOut t)
-                           else pure $ Just $ fromText (tsRaw fThy)
-         Nothing   -> pure Nothing
-smt2AppArg _ _
-  = pure Nothing
-
-isPolyCtor :: TheorySymbol -> Sort -> Bool
-isPolyCtor fThy t = isPolyInst (tsSort fThy) t && tsInterp fThy == Ctor
+-- The selected container carrier, not the source spelling of an application,
+-- determines its interpretation. This also interprets the defining equations
+-- for first-class native values, after the same ordinary sort judgment.
+smt2ArrayApp :: SymEnv -> TheorySymbol -> Sort -> [Builder] -> Maybe Builder
+smt2ArrayApp env declaration t arguments = do
+    guard (tsInterp declaration == Theory)
+    let operation = tsRaw declaration
+    container <- case t of
+        FFunc first (FFunc second _)
+            | operation == "set.member" || operation == "bag.count" -> Just second
+            | operation == "set.subset" || operation == "bag.subbag" || operation == mapSel -> Just first
+        FFunc first _ | operation == "set.is_empty" -> Just first
+        _ -> Just (ffuncOut t)
+    array@(SArray index _) <- Just (sortSmtSort True env container)
+    let constant value = key (key "as const" (smt2SmtSort array)) value
+        allTrue = key (key "as const" (smt2SmtSort (SArray index SBool))) "true"
+    case arguments of
+        [value]
+            | operation == mapDef -> Just (constant value)
+            | operation == "set.empty" -> Just (constant "false")
+            | operation == "set.is_empty" -> Just (key2 "=" (constant "false") value)
+            | operation == "set.singleton" -> Just (key3 "store" (constant "false") value "true")
+            | operation == "set.complement" -> Just (key "(_ map not)" value)
+            | operation == "bag.empty" -> Just (constant "0")
+        [left, right]
+            | operation == mapSel -> Just (key2 "select" left right)
+            | operation == "set.member" || operation == "bag.count" -> Just (key2 "select" right left)
+            | operation == "set.union" -> Just (key2 "(_ map or)" left right)
+            | operation == "set.inter" -> Just (key2 "(_ map and)" left right)
+            | operation == "set.insert" -> Just (key3 "store" right left "true")
+            | operation == "set.minus" -> Just (key2 "(_ map and)" left (key "(_ map not)" right))
+            | operation == "set.subset" -> Just (key2 "=" allTrue (key2 "(_ map =>)" left right))
+            | operation == "bag" -> Just (key3 "store" (constant "0") left right)
+            | operation == "bag.union_disjoint" -> Just (key2 "(_ map (+ (Int Int) Int))" left right)
+            | operation == "bag.subbag" -> Just (key2 "=" allTrue (key2 "(_ map (<= (Int Int) Bool))" left right))
+            | operation == "bag.union_max" -> Just (key3 "(_ map (ite (Bool Int Int) Int))" (key2 "(_ map (> (Int Int) Bool))" left right) left right)
+            | operation == "bag.inter_min" -> Just (key3 "(_ map (ite (Bool Int Int) Int))" (key2 "(_ map (<= (Int Int) Bool))" left right) left right)
+        [arrayValue, indexValue, value]
+            | operation == mapSto -> Just (key3 "store" arrayValue indexValue value)
+        _ -> Nothing
 
 ffuncOut :: Sort -> Sort
 ffuncOut t = maybe t (last . snd) (bkFFunc t)
@@ -395,6 +420,7 @@ isSmt2App _  _                   = Nothing
 
 thyAppInfo :: TheorySymbol -> Maybe Int
 thyAppInfo ti = case tsInterp ti of
+  Uninterp -> Nothing
   Field    -> Just 1
   _        -> sortAppInfo (tsSort ti)
 
@@ -443,13 +469,17 @@ interpSymbols cfg =
   , interpSym mapSel   mapSel  mapSelSort
   , interpSym mapSto   mapSto  mapStoSort
 
-  , interpSym arrConstM  "const"  (FAbs 0 $ FFunc (FVar 1) mapArrSort)
-  , interpSym arrSelectM "select" (FAbs 0 $ FFunc mapArrSort $ FFunc (FVar 0) (FVar 1))
-  , interpSym arrStoreM  "store"  (FAbs 0 $ FFunc mapArrSort $ FFunc (FVar 0) $ FFunc (FVar 1) mapArrSort)
+  , interpSym arrConstM  "const"  (FAbs 0 $ FAbs 1 $ FFunc (FVar 1) mapArrSort)
+  , interpSym arrSelectM "select" arraySelectSort
+  , interpSym arrStoreM  "store"  arrayStoreSort
+  , interpSym "select"   "select" arraySelectSort
+  , interpSym "store"    "store"  arrayStoreSort
 
   -- CVC5 sets
 
-  , interpSym setCard  "set.card"       (FAbs 0 $ FFunc (setSort $ FVar 0) intSort)
+  -- Z3 has no native set cardinality: retain an ordinary polymorphic value,
+  -- with no cardinality axioms, instead of one Int-element SMT declaration.
+  , (setCard, Thy setCard "set.card" (FAbs 0 $ FFunc (setSort $ FVar 0) intSort) (if cfg == Z3 || cfg == Z3mem then Uninterp else Theory))
   , interpSym setEmp   "set.is_empty"   (FAbs 0 $ FFunc (setSort $ FVar 0) boolSort)
   , interpSym setEmpty "set.empty"      (FAbs 0 $ FFunc intSort (setSort $ FVar 0))
   , interpSym setSng   "set.singleton"  (FAbs 0 $ FFunc (FVar 0) (setSort $ FVar 0))
@@ -475,10 +505,10 @@ interpSymbols cfg =
   , interpSym strLen     strLen    strLenSort
   , interpSym strSubstr  strSubstr substrSort
   , interpSym strConcat  strConcat concatstrSort
-  , interpSym strConcat' smtlibStrConcat concatstrSort
-  , interpSym strPrefixOf smtlibStrPrefixOf strCompareSort
-  , interpSym strSuffixOf smtlibStrSuffixOf strCompareSort
-  , interpSym strContains smtlibStrContains strCompareSort
+  , interpSym strConcat' strConcat concatstrSort
+  , interpSym strPrefixOf strPrefixOf strCompareSort
+  , interpSym strSuffixOf strSuffixOf strCompareSort
+  , interpSym strContains strContains strCompareSort
 
   , interpSym boolInt   boolInt   (FFunc boolSort intSort)
 
@@ -578,6 +608,8 @@ interpSymbols cfg =
   where
 
     mapArrSort = arraySort (FVar 0) (FVar 1)
+    arraySelectSort = FAbs 0 $ FAbs 1 $ FFunc mapArrSort $ FFunc (FVar 0) (FVar 1)
+    arrayStoreSort = FAbs 0 $ FAbs 1 $ FFunc mapArrSort $ FFunc (FVar 0) $ FFunc (FVar 1) mapArrSort
     setArrSort = arraySort (FVar 0) boolSort
     bagArrSort = arraySort (FVar 0) intSort
     bv8        = sizedBitVecSort "Size8"
@@ -759,7 +791,7 @@ testTheory t x = (sx, Thy sx raw t Test)
     raw        = "is-" <> symbolRaw x
 
 symbolRaw :: Symbol -> Data.Text.Text
-symbolRaw = symbolSafeText
+symbolRaw = symbolSmtText
 
 --------------------------------------------------------------------------------
 selectSymbols :: DataDecl -> [(Symbol, TheorySymbol)]

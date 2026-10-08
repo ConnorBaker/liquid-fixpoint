@@ -9,7 +9,9 @@
 module Language.Fixpoint.Solver.UniqifyBinds (renameAll) where
 
 import           Language.Fixpoint.Types
+import           Language.Fixpoint.Types.Visitor (mapKVarSubsts)
 import           Language.Fixpoint.Solver.Sanitize (dropDeadSubsts)
+import           Language.Fixpoint.Solver.UniqifyKVars (occupiedSymbols)
 import           Language.Fixpoint.Misc          (fst3, mlookup, snd3)
 
 import qualified Data.HashMap.Strict as M
@@ -18,7 +20,7 @@ import qualified Data.List           as L
 #if !MIN_VERSION_base(4,20,0)
 import           Data.Foldable       (foldl')
 #endif
-import           Data.Maybe          (catMaybes, mapMaybe, fromJust, isJust)
+import           Data.Maybe          (catMaybes, mapMaybe, fromJust)
 import           Data.Hashable       (Hashable)
 import           GHC.Generics        (Generic)
 import           Control.DeepSeq     (NFData, ($!!))
@@ -31,10 +33,38 @@ renameAll fi2 = fi6
   where
     fi6       = {- SCC "dropDead"    -} dropDeadSubsts  fi5
     fi5       = {- SCC "dropUnused"  -} dropUnusedBinds fi4
-    fi4       = {- SCC "renameBinds" -} renameBinds fi3 $!! rnm
+    fi4       = {- SCC "renameBinds" -} renameKVarSubsts fi3 (renameBinds fi3 $!! rnm)
     fi3       = {- SCC "renameVars"  -} renameVars fi2 rnm $!! idm
-    rnm       = {- SCC "mkRenameMap" -} mkRenameMap $!! bs fi2
+    rnm       = {- SCC "mkRenameMap" -} mkRenameMap fi2
     idm       = {- SCC "mkIdMap"     -} mkIdMap fi2
+
+-- Renaming a WF binder also renames the formal parameter of every occurrence
+-- of its KVar. Transport the actuals by BindId, not by the generated spelling:
+-- that spelling may collide with a source binder of another sort.
+renameKVarSubsts :: SInfo a -> SInfo a -> SInfo a
+renameKVarSubsts before after
+  | all (all (uncurry (==))) (M.elems namesByKVar) = after
+  | otherwise = mapKVarSubsts rekey after
+  where
+    namesByKVar = M.map names (ws before)
+    names w =
+        [ (old, new)
+        | i <- elemsIBindEnv (wenv w)
+        , let (old, _, _) = lookupBindEnv i (bs before)
+        , let (new, _, _) = lookupBindEnv i (bs after)
+        ]
+    rekey k su = toKVarSubst $ M.union translated untouched
+      where
+        actuals = fromKVarSubst su
+        namesForKVar = M.lookupDefault [] k namesByKVar
+        oldNames = S.fromList (map fst namesForKVar)
+        translated =
+            M.fromList
+                [ (new, actual)
+                | (old, new) <- namesForKVar
+                , Just actual <- [M.lookup old actuals]
+                ]
+        untouched = M.filterWithKey (\key _ -> not (S.member key oldNames)) actuals
 
 
 --------------------------------------------------------------------------------
@@ -95,26 +125,25 @@ namesToIds :: S.HashSet Symbol -> M.HashMap Symbol BindId -> S.HashSet BindId
 namesToIds xs m = S.fromList $ catMaybes [M.lookup x m | x <- S.toList xs] --TODO why any Nothings?
 
 --------------------------------------------------------------------------------
-mkRenameMap :: BindEnv a -> RenameMap
+mkRenameMap :: SInfo a -> RenameMap
 --------------------------------------------------------------------------------
-mkRenameMap be = foldl' (addId be) M.empty ids
+mkRenameMap fi = fst $ foldl' addId (M.empty, occupied) ids
   where
-    ids = fst <$> bindEnvToList be
-
-addId :: BindEnv a -> RenameMap -> BindId -> RenameMap
-addId be m i
-  | M.member sym m = addDupId m sym t i
-  | otherwise      = M.insert sym [(t, Nothing)] m
-  where
-    t              = sr_sort sr
-    (sym, sr, _)   = lookupBindEnv i be
-
-addDupId :: RenameMap -> Symbol -> Sort -> BindId -> RenameMap
-addDupId m sym t i
-  | isJust $ L.lookup t mapping = m
-  | otherwise                   = M.insert sym ((t, Just $ renameSymbol sym i) : mapping) m
-  where
-    mapping = fromJust $ M.lookup sym m
+    be = bs fi
+    bindings = bindEnvToList be
+    ids = L.sort (fst <$> bindings)
+    occupied = occupiedSymbols fi
+    addId (m, used) i =
+        case M.lookup sym m of
+            Nothing -> (M.insert sym [(t, Nothing)] m, used)
+            Just mapping
+                | Just _ <- L.lookup t mapping -> (m, used)
+                | otherwise ->
+                    let (used', new) = freshInNS (renameSymbol sym i) used
+                     in (M.insert sym ((t, Just new) : mapping) m, used')
+      where
+        (sym, sr, _) = lookupBindEnv i be
+        t = sr_sort sr
 
 --------------------------------------------------------------------------------
 -- | `renameVars` seems to do the actual work of renaming all the binders

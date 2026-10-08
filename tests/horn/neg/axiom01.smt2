@@ -1,4 +1,5 @@
 (fixpoint "--eliminate=horn")
+(fixpoint "--mbqi")
 
 (constant M (func 0 (Int Int) Int))
 

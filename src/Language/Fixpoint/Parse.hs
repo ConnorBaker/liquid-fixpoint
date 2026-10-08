@@ -1317,6 +1317,7 @@ data Def a
   | Adt  !DataDecl
   | AutoRW !Int !AutoRewrite
   | RWMap ![(Int,Int)]
+  | NativeEquations !(S.HashSet Symbol)
   deriving (Show, Generic)
   --  Sol of solbind
   --  Dep of FixConstraint.dep
@@ -1347,6 +1348,7 @@ defP =  Srt   <$> (reserved "sort"         >> colon >> sortP)
     <|> Adt    <$> (reserved "data"        >> dataDeclP)
     <|> AutoRW <$> (reserved "autorewrite" >> intP) <*> autoRewriteP
     <|> RWMap  <$> (reserved "rewrite"     >> pairsP intP intP)
+    <|> NativeEquations <$> (reserved "nativeequations" >> (S.fromList <$> brackets (sepBy symbolP semi)))
 
 
 sortedReftP :: Parser SortedReft
@@ -1438,7 +1440,8 @@ defsFInfo defs = {- SCC "defsFI" -} Types.FI cm ws bs lts dts kts qs binfo adts 
                        Nothing ->
                          map'
     cid        = fromJust . sid
-    ae         = AEnv eqs rews expand rwMap
+    ae         = (AEnv eqs rews expand rwMap Nothing) <> mconcat
+                   [mempty {aenvNative = Just names} | NativeEquations names <- defs]
     lrws       = LocalRewritesMap $ M.fromList [ (bid, LocalRewrites $ M.fromList rws) | LDef (bid, rws) <- defs ]
     adts       =                    [d                  | Adt d       <- defs]
     -- msg    = show $ "#Lits = " ++ (show $ length consts)

@@ -67,12 +67,12 @@ extendExpr ann p expr'
     where
       e' = normalize expr'
       goP Pos (PAtom b e1 e2)
-       | b == Eq || b == Ne
+       | b == Eq
        , Just s <- getArg (exprSort "extensionality" e1)
        = mytracepp ("extending POS = " ++ showpp expr') <$> (extendRHS ann b e1 e2 s >>= goP Pos)
       goP _ e = return e
       goN Neg (PAtom b e1 e2)
-       | b == Eq || b == Ne
+       | b == Eq
        , Just s <- getArg (exprSort "extensionality" e1)
        = mytracepp ("extending NEG = " ++ showpp expr') <$> (extendLHS ann b e1 e2 s >>= goN Neg)
       goN _ e = return e
@@ -153,7 +153,9 @@ mapMPosExpr pos f = go pos
     -- The below cannot appear due to normalization
     go p (PNot e)        = f p . PNot =<< go p e
     go p (PIff p1 p2)    = f p =<< (PIff        <$>  go p p1 <*> go p p2            )
-    go p (EIte e e1 e2)  = f p =<< (EIte        <$>  go p e  <*> go p e1 <*> go p e2)
+    -- A condition occurs in both polarities. Keep it intact rather than
+    -- choosing one extensional expansion, and retain demand on each branch.
+    go p (EIte e e1 e2)  = f p =<< (EIte e <$> go p e1 <*> go p e2)
     go p (POr  ps)       = f p . POr =<< (go p `traverse` ps)
 
     -- The following canot appear in general
@@ -171,15 +173,18 @@ normalize expr' = mytracepp ("normalize: " ++ showpp expr') $ go expr'
     go e@(EVar _)        = e
     go e@(PKVar {})        = e
     go e@(ENeg _)        = e
-    go (PNot e)          = PImp e PFalse
+    go (PNot e)          = PImp (go e) PFalse
     go e@(ECst _ _)      = e
     go e@ECoerc{}        = e
     go e@(EApp _ _)      = e
     go e@EBin{}          = e
     go (PImp p1 p2)      = PImp (go p1) (go p2)
     go (PIff p1 p2)      = PAnd [PImp p1' p2', PImp p2' p1'] where (p1', p2') = (go p1, go p2)
+    -- Disequality is negated equality, not pointwise disequality. In
+    -- particular, f /= g does not imply f x /= g x for an arbitrary x.
+    go (PAtom Ne e1 e2)  = PImp (PAtom Eq e1 e2) PFalse
     go e@PAtom{}         = e
-    go (EIte e e1 e2)    = go $ PAnd [PImp e e1, PImp (PNot e) e2]
+    go (EIte e e1 e2)    = EIte e (go e1) (go e2)
     go (PAnd ps)         = pAnd (go <$> ps)
     go (POr  ps)         = foldl' (\x y -> PImp (PImp (go x) PFalse) y) PFalse ps
     go e@ELet{}          = e

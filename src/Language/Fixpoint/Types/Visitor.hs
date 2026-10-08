@@ -40,9 +40,9 @@ module Language.Fixpoint.Types.Visitor (
   -- * Coercion Substitutions
   , CoSub
   , applyCoSub
-  , CoSubV
-  , applyCoSubV
   , applyCoercion
+  , resolveExprSorts
+  , exprFreeSortNames
 
   -- * Predicates on Constraints
   , isConcC , isConc, isKvarC
@@ -55,10 +55,12 @@ module Language.Fixpoint.Types.Visitor (
 
 -- import           Control.Monad.Trans.State.Strict (State, modify, runState)
 -- import           Control.DeepSeq
-import           Control.Monad.State.Strict
 import qualified Data.HashSet        as S
 import qualified Data.HashMap.Strict as M
+import qualified Data.IntMap.Strict  as IM
 import qualified Data.List           as L
+import qualified Data.Generics       as G
+import qualified Data.Text           as T
 import           Language.Fixpoint.Types hiding (mapSort)
 import qualified Language.Fixpoint.Misc as Misc
 import Control.Monad.Reader
@@ -298,9 +300,12 @@ mapExpr f = trans f
 
 -- | Specialized and faster version of mapExpr for expressions
 mapExprOnExpr :: (Expr -> Expr) -> Expr -> Expr
-mapExprOnExpr f = go
+mapExprOnExpr f = mapExprOnExprScoped id const (\() -> f) ()
+
+mapExprOnExprScoped :: ([Expr] -> [Expr]) -> (context -> Expr -> context) -> (context -> Expr -> Expr) -> context -> Expr -> Expr
+mapExprOnExprScoped demand enter finish = walk
   where
-    go !e0 = f $! case e0 of
+    walk context !e0 = finish current $! case e0 of
       EApp f e ->
         let !f' = go f
             !e' = go e
@@ -325,10 +330,10 @@ mapExprOnExpr f = go
         let !e' = go e
         in ECst e' t
       PAnd ps ->
-        let !ps' = map go ps
+        let !ps' = demand (map go ps)
         in PAnd ps'
       POr ps ->
-        let !ps' = map go ps
+        let !ps' = demand (map go ps)
         in POr ps'
       PNot p ->
         let !p' = go p
@@ -367,6 +372,9 @@ mapExprOnExpr f = go
       e@EVar{} -> e
       e@ESym{} -> e
       e@ECon{} -> e
+      where
+        current = enter context e0
+        go = walk current
 
 -- mapExprOnExpr :: (Expr -> Expr) -> Expr -> Expr
 -- mapExprOnExpr f = go
@@ -425,7 +433,7 @@ mapMExpr f = go
 mapKVarSubsts :: Visitable t => (KVar -> KVarSubst Symbol Symbol -> KVarSubst Symbol Symbol) -> t -> t
 mapKVarSubsts f          = trans txK
   where
-    txK (PKVar k tsu su)   = PKVar k tsu (f k su)
+    txK (PKVar k tsu su) = PKVar k tsu (f k (mapKVarSubst (trans txK) su))
     txK p              = p
 
 newtype MInt = MInt Integer -- deriving (Eq, NFData)
@@ -535,36 +543,74 @@ stripCasts = mapExprOnExpr go
 --------------------------------------------------------------------------------
 type CoSub = M.HashMap Symbol Sort
 
-applyCoSub :: CoSub -> Expr -> Expr
-applyCoSub coSub
-   | M.null coSub = id
-   | otherwise = mapExprOnExpr fE
+{- | Interpret owned annotations after solving one judgment. Term binders do
+not bind sort coordinates. Named type binders can occur in opaque KVar actuals:
+rename their original coordinates before inserting free substitution images.
+Only that type-binding case demands the expression/image name inventory;
+declaration names are checked by lookup, never enumerated.
+-}
+exprFreeSortNames :: Expr -> S.HashSet Symbol
+exprFreeSortNames = G.everythingBut S.union (G.mkQ (S.empty, False) sorts `G.extQ` scope `G.extQ` symbol `G.extQ` text)
   where
-    fE (ECoerc s t e) = ECoerc  (txS s) (txS t) e
-    fE (ELam (x,t) e) = ELam (x, txS t)         e
-    fE (ECst e t)     = ECst e (txS t)
-    fE (PExist xts p) = PExist (map (fmap txS) xts) (fE p)
-    fE (PAll xts p) = PAll (map (fmap txS) xts) (fE p)
-    fE e              = e
-    txS               = mapSortOnlyOnce fS
-    fS (FObj a)       = {- FObj -} txV a
-    fS t              = t
-    txV a             = M.lookupDefault (FObj a) a coSub
+    sorts :: Sort -> (S.HashSet Symbol, Bool)
+    sorts sort = (sortSymbols sort, True)
+    scope :: Expr -> (S.HashSet Symbol, Bool)
+    scope (ETAbs body name) = (S.delete name (exprFreeSortNames body), True)
+    scope _ = (S.empty, False)
+    symbol :: Symbol -> (S.HashSet Symbol, Bool)
+    symbol _ = (S.empty, True)
+    text :: T.Text -> (S.HashSet Symbol, Bool)
+    text _ = (S.empty, True)
 
+applyCoSub :: SortSubst -> Expr -> Expr
+applyCoSub substitution expression
+    | M.null substitution = expression
+    | otherwise = transformExprSorts Nothing substitution mempty expression
 
-type CoSubV = M.HashMap Sort Sort
-
-applyCoSubV :: CoSubV -> Expr -> Expr
-applyCoSubV coSub = mapExprOnExpr fE
+resolveExprSorts :: (Symbol -> Maybe Sort) -> IM.IntMap Sort -> Expr -> Expr
+resolveExprSorts declarations substitution = mapExprOnExpr normalize . transformExprSorts (Just declarations) mempty substitution
   where
-    fE (ECoerc s t e) = ECoerc  (txS s) (txS t) e
-    fE (ELam (x,t) e) = ELam (x, txS t)         e
-    fE (ECst e t)     = ECst e (txS t)
-    fE e              = e
+    normalize (ECst body sort) = eCst body sort
+    normalize value = value
 
-    txS               = mapSortOnlyOnce fS
-
-    fS t              = M.lookupDefault t t coSub
+transformExprSorts :: Maybe (Symbol -> Maybe Sort) -> SortSubst -> IM.IntMap Sort -> Expr -> Expr
+transformExprSorts declarations substitution indexed expression = transform M.empty expression
+  where
+    transform = mapExprOnExprScoped listDemand bind interpret
+    listDemand = case declarations of
+        Nothing -> id
+        Just _ -> \values -> foldr (\value rest -> value `seq` rest) () values `seq` values
+    names = G.everythingBut S.union (G.mkQ (S.empty, False) symbol `G.extQ` sorts)
+    symbol :: Symbol -> (S.HashSet Symbol, Bool)
+    symbol name = (S.singleton name, True)
+    sorts :: Sort -> (S.HashSet Symbol, Bool)
+    sorts sort = (sortSymbols sort, True)
+    bind ren whole@(ETAbs body name) = M.insert name chosen ren
+      where
+        needed = exprFreeSortNames whole
+        images = foldMap sortSymbols indexed `S.union` foldMap sortSymbols (M.filterWithKey (\key _ -> key /= name && not (M.member key ren) && S.member key needed) substitution)
+        occupied = names (case declarations of Nothing -> body; Just _ -> expression) `S.union` images `S.union` S.fromList (M.elems ren)
+        declaration key = declarations >>= (\lookupKind -> lookupKind key)
+        chosen
+            | S.member name images || declaration name /= Nothing || (case declarations of Nothing -> False; Just _ -> M.member name ren) = head (filter (\candidate -> not (S.member candidate occupied) && declaration candidate == Nothing) (candidates name))
+            | otherwise = name
+    bind ren _ = ren
+    interpret ren value = case value of
+        ECon (L literal sort) -> ECon (L literal (tx sort))
+        ECst body sort -> ECst body (tx sort)
+        ELam (name, sort) body -> ELam (name, tx sort) body
+        ETApp body sort -> ETApp body (tx sort)
+        ETAbs body name -> ETAbs body (M.lookupDefault name name ren)
+        ECoerc source target body -> ECoerc (tx source) (tx target) body
+        PAll bindings body -> PAll (map (fmap tx) bindings) body
+        PExist bindings body -> PExist (map (fmap tx) bindings) body
+        PKVar kvar types actuals -> PKVar kvar (tx <$> types) actuals
+        _ -> value
+      where
+        tx = close . substituteSort ((FObj <$> ren) `M.union` substitution) indexed
+        close = case declarations of
+            Nothing -> id
+            Just lookupKind -> resolveNumericSort (\name -> if name `elem` M.elems ren then Nothing else lookupKind name)
 
 applyCoercion :: Symbol -> Sort -> Sort -> Sort
 applyCoercion a t = mapSortOnlyOnce f
@@ -582,7 +628,7 @@ foldSort f = step
     step b t           = go (f b t) t
     go b (FFunc t1 t2) = L.foldl' step b [t1, t2]
     go b (FApp t1 t2)  = L.foldl' step b [t1, t2]
-    go b (FAbs _ t)    = go b t
+    go b (FAbs _ t)    = step b t
     go b _             = b
 
 -- | Like 'mapSort' but it doesn't substitute on the result

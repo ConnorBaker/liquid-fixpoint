@@ -51,8 +51,6 @@ module Language.Fixpoint.Types.Environments (
   , bindEnvFromList, bindEnvToList, deleteBindEnv, elemsBindEnv
   , EBindEnv, splitByQuantifiers
 
-  , coerceBindEnv
-
   -- * Information needed to lookup and update Solutions
   -- , SolEnv (..)
 
@@ -76,7 +74,6 @@ import           Data.Function             (on)
 import           Text.PrettyPrint.HughesPJ.Compat
 import           Control.DeepSeq
 
-import           Language.Fixpoint.Types.Config
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Binders
 import           Language.Fixpoint.Types.Names
@@ -88,7 +85,7 @@ import           Language.Fixpoint.Misc
 type BindId        = Int
 type BindMap a     = M.HashMap BindId a
 
-newtype IBindEnv   = FB (S.HashSet BindId) deriving (Eq, Data, Show, Typeable, Generic)
+newtype IBindEnv = FB (S.HashSet BindId) deriving (Eq, Hashable, Data, Show, Typeable, Generic)
 
 instance PPrint IBindEnv where
   pprintTidy _ = pprint . L.sort . elemsIBindEnv
@@ -376,9 +373,3 @@ makePack kvss = Packs (M.fromList kIs)
   where
     kIs       = [ (k, i) | (i, ks) <- kPacks, k <- ks ]
     kPacks    = zip [0..] . coalesce . fmap S.toList $ kvss
-
-coerceBindEnv :: ElabFlags -> BindEnv a -> BindEnv a
-coerceBindEnv ef be = be { beBinds = M.map (\(s, sr, a) ->
-                                                let srs = coerceMapToArray (sr_sort sr) in
-                                                (s, sr { sr_sort = if elabSetBag ef then coerceSetBagToArray srs else srs } , a))
-                                            (beBinds be) }

@@ -28,6 +28,7 @@ module Language.Fixpoint.Types.Substitutions (
   , Subable(..)
   , subst
   , rapierSubstExpr
+  , rapierSubstExprWith
   , filterSubst
   , catSubst
   , exprSymbolsSet
@@ -36,6 +37,7 @@ module Language.Fixpoint.Types.Substitutions (
   , freshInNS
   , freshInNSL
   , meetReft
+  , meetReftWithScope
   , pprReft
   ) where
 
@@ -100,9 +102,6 @@ isEmptySubst (Su xes) = M.null xes
 
 substSymbolsSet :: (Eq v, Hashable v) => SubstV v -> S.HashSet v
 substSymbolsSet (Su m) = S.unions $ map exprSymbolsSet (M.elems m)
-
-toListSubst :: SubstV v -> [(v, ExprBV v v)]
-toListSubst (Su m) = M.toList m
 
 -- | The Subable class provides overloaded names to compute the free symbols of
 -- a value, and to perform capture-avoiding substitution on it.
@@ -184,9 +183,6 @@ substExcept  :: Eq v => SubstV v -> [v] -> SubstV v
 -- substExcept  (Su m) xs = Su (foldr M.delete m xs)
 substExcept (Su xes) xs = Su $ M.filterWithKey (const . not . (`elem` xs)) xes
 
-appSubst :: (Eq v, Hashable v) => SubstV v -> v -> ExprBV v v
-appSubst (Su s) x = M.findWithDefault (EVar x) x s
-
 instance (Eq v, Hashable v, Refreshable v) => Subable (ExprBV v v) where
   type Variable (ExprBV v v) = v
   syms  = exprSymbolsSet
@@ -199,17 +195,17 @@ class Refreshable v where
   candidates :: v -> [v]
 
 instance Refreshable Symbol where
-  candidates x =
-     let (x', i) = splitIntSuffix x
-      in x : map (intSymbol x') [i..]
-    where
-      splitIntSuffix sx =
-        case T.breakOnEnd symSepName (symbolText sx) of
-          (pfx, sfx)
-            | T.null pfx -> (sx, 0 :: Int)
-            | otherwise  -> case reads (T.unpack sfx) of
-              ((i, []) : _) -> (unSuffixSymbol sx, i + 1 :: Int)
-              _ -> (sx, 0 :: Int)
+    candidates x =
+        let (x', i) = splitIntSuffix x
+         in x : map (\j -> symbol (x' <> symSepName <> T.pack (show j))) [i ..]
+      where
+        splitIntSuffix sx =
+            case T.breakOnEnd symSepName (symbolText sx) of
+                (pfx, sfx)
+                    | T.null pfx -> (symbolText sx, 0 :: Integer)
+                    | otherwise -> case reads (T.unpack sfx) of
+                        ((i, []) : _) -> (T.dropEnd (T.length symSepName) pfx, i + 1 :: Integer)
+                        _ -> (symbolText sx, 0 :: Integer)
 
 -- | Rapier style capture-avoiding substitution
 --
@@ -217,17 +213,28 @@ instance Refreshable Symbol where
 rapierSubstExpr
   :: (HasCallStack, Eq v, Hashable v, Refreshable v)
   => S.HashSet v -> SubstV v -> ExprBV v v -> ExprBV v v
-rapierSubstExpr = go
+rapierSubstExpr s (Su su) = rapierSubstExprWith id id s su
+
+-- | The same scoped action when occurrences carry information beyond their
+-- binding owner.  @owner (fresh x) == x@; untouched occurrences retain their
+-- original representation (for example, their source locations).
+rapierSubstExprWith
+  :: (HasCallStack, Hashable b, Refreshable b)
+  => (v -> b) -> (b -> v) -> S.HashSet b -> M.HashMap b (ExprBV b v)
+  -> ExprBV b v -> ExprBV b v
+rapierSubstExprWith owner fresh = go
   where
     go s su e0 = case e0 of
         EApp f e -> EApp (go s su f) (go s su e)
+        ETApp e t -> ETApp (go s su e) t
+        ETAbs e x -> ETAbs (go s su e) x
         ELam (x, t) e ->
           let (s', x') = freshInNS x s
-              su' = extendSubstWithVar su x x'
+              su' = extendOwner su x x'
            in ELam (x', t) (go s' su' e)
         ELet x e1 e2 ->
           let (s', x') = freshInNS x s
-              su' = extendSubstWithVar su x x'
+              su' = extendOwner su x x'
            in ELet x' (go s su e1) (go s' su' e2)
 
         ECoerc a t e -> ECoerc a t (go s su e)
@@ -236,7 +243,7 @@ rapierSubstExpr = go
         EIte p e1 e2 -> EIte (go s su p) (go s su e1) (go s su e2)
         ECst e so -> ECst (go s su e) so
         EVar x
-          | S.member x s -> appSubst su x
+          | S.member (owner x) s -> M.findWithDefault (EVar x) (owner x) su
           | otherwise -> error "rapierSubstExpr: variable not in scope set"
         PAnd ps -> PAnd $ map (go s su) ps
         POr ps -> POr $ map (go s su) ps
@@ -248,22 +255,26 @@ rapierSubstExpr = go
         PAll bs p ->
           let xs = map fst bs
               (s', fs) = freshInNSL xs s
-              su' = List.foldl' (\su1 (x, x') -> extendSubstWithVar su1 x x') su (zip xs fs)
+              su' = List.foldl' (\su1 (x, x') -> extendOwner su1 x x') su (zip xs fs)
               bs' = zip fs (map snd bs)
            in
               PAll bs' $ go s' su' p
         PExist bs p ->
           let xs = map fst bs
               (s', fs) = freshInNSL xs s
-              su' = List.foldl' (\su1 (x, x') -> extendSubstWithVar su1 x x') su (zip xs fs)
+              su' = List.foldl' (\su1 (x, x') -> extendOwner su1 x x') su (zip xs fs)
               bs' = zip fs (map snd bs)
            in
               PExist bs' $ go s' su' p
         p -> p
 
-    catSubstGo su1 su2 s = catKVarSubst su1' (toListSubst su2)
+    extendOwner su x x'
+      | x == x' = M.delete x su
+      | otherwise = M.insert x (EVar (fresh x')) su
+
+    catSubstGo su1 su2 s = catKVarSubst su1' (M.toList su2)
       where
-        su1' = mapKVarSubst (rapierSubstExpr s su2) su1
+        su1' = mapKVarSubst (go s su2) su1
 
 extendSubst :: Hashable v => SubstV v -> v -> ExprBV v v -> SubstV v
 extendSubst (Su m) x e = Su $ M.insert x e m
@@ -277,11 +288,23 @@ extendSubstWithVar su@(Su m) x x'
   | otherwise = extendSubst su x (EVar x')
 
 meetReft :: (Refreshable v, Binder v) => ReftBV v v -> ReftBV v v -> ReftBV v v
-meetReft (Reft (v, ra)) (Reft (v', ra'))
-  | v == v'          = Reft (v , pAnd [ra, ra'])
-  | v == wildcard    = Reft (v', pAnd [ra', ra `subst1`  (v , EVar v')])
-  | otherwise        = Reft (v , pAnd [ra, ra' `subst1` (v', EVar v )])
+meetReft = meetReftWithScope S.empty S.empty
 
+-- | Conjunction when additional bodies share each refinement's root binder.
+-- The extra sets contain their free variables, excluding their own root.
+meetReftWithScope :: (Refreshable v, Binder v) => S.HashSet v -> S.HashSet v -> ReftBV v v -> ReftBV v v -> ReftBV v v
+meetReftWithScope leftFree rightFree left@(Reft (v, ra)) right@(Reft (v', ra'))
+    | v == v' = Reft (v, pAnd [ra, ra'])
+    | otherwise = Reft (value, pAnd [rebase v ra, rebase v' ra'])
+  where
+    preferred = if v == wildcard then v' else v
+    opposite = if v == wildcard then syms left `S.union` leftFree else syms right `S.union` rightFree
+    value
+        | not (preferred `S.member` opposite) = preferred
+        | otherwise = snd (freshInNS preferred (syms left `S.union` syms right `S.union` leftFree `S.union` rightFree))
+    rebase old predicate
+        | old == value = predicate
+        | otherwise = predicate `subst1` (old, EVar value)
 
 freshInNS :: (Refreshable v, Hashable v) => v -> S.HashSet v -> (S.HashSet v, v)
 freshInNS x s =

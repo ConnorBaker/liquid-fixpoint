@@ -13,7 +13,7 @@
 
 module Language.Fixpoint.Solver.Solve (solve) where
 
-import           Control.Monad (forM, when, filterM)
+import           Control.Monad (forM, when, filterM, foldM)
 import           Control.Monad.Reader
 import           Language.Fixpoint.Misc
 import qualified Language.Fixpoint.Misc            as Misc
@@ -21,7 +21,7 @@ import qualified Language.Fixpoint.Types           as F
 import qualified Language.Fixpoint.Types.Solutions as Sol
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Config hiding (stats)
-import           Language.Fixpoint.SortCheck          (ElabParam(..), elaborate)
+import           Language.Fixpoint.SortCheck          (ElabParam(..), elaborate, unApply, unElab)
 import           Language.Fixpoint.Solver.Sanitize (symbolEnv)
 import qualified Language.Fixpoint.Solver.Solution  as S
 import qualified Language.Fixpoint.Smt.Types as T
@@ -40,9 +40,9 @@ import qualified Data.HashSet        as S
 import qualified Data.List           as L
 import Language.Fixpoint.Types (resStatus, FixResult(Unsafe))
 import Language.Fixpoint.Smt.Interface (smtComment)
+import qualified Language.Fixpoint.Types.Errors as Errors
 import Language.Fixpoint.Solver.Interpreter (instInterpreter)
 import qualified Language.Fixpoint.Solver.PLE as PLE      (instantiate)
-import Data.Maybe (maybeToList)
 
 mytrace :: String -> a -> a
 mytrace
@@ -59,12 +59,13 @@ solve_ :: (NFData a, F.Fixpoint a, F.Loc a)
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
-solve
-  :: forall a. (NFData a, F.Fixpoint a, Show a, F.Loc a)
-  => Config -> ElabParam -> S.HashSet F.Symbol -> F.SInfo a -> IO (F.Result (Integer, a))
+solve ::
+    forall a.
+    (NFData a, F.Fixpoint a, Show a, F.Loc a) =>
+    Config -> F.SInfo a -> ElabParam -> S.HashSet F.Symbol -> F.SourceScopes -> F.SInfo a -> IO (F.Result (Integer, a))
 --------------------------------------------------------------------------------
 
-solve cfg elabParam scope fi = do
+solve cfg source elabParam scope sourceScopes fi = do
     whenLoud $ donePhase Misc.Loud "Worklist Initialize"
     vb <- getVerbosity
     (res, stat) <- (if Quiet == vb then id else withProgressFI sI) $ runSolverM cfg sI elabParam act
@@ -74,27 +75,23 @@ solve cfg elabParam scope fi = do
   where
     act :: SolveM a (F.Result (Integer, a), Stats)
     act = do
-      ctx <- getContext
-      let sEnv = symbolEnv cfg fi
-          s1 = s0{Sol.sMap = M.map (elabQBind ctx "solve" sEnv) (Sol.sMap s0)}
-      solve_ cfg scope fi s1 wkl
+        ctx <- getContext
+        let sEnv = symbolEnv cfg fi
+            elaborateQualifier = elaborate (ElabParam (T.ctxElabF ctx) (F.atLoc F.dummySpan "solve") sEnv)
+            s1 = s0{Sol.sMap = M.map (elabQBind elaborateQualifier) (Sol.sMap s0)}
+        (result, statistics) <- solve_ cfg source scope sourceScopes fi s1 wkl
+        pure (tidyResult cfg (F.seSort sEnv) result, statistics)
     -- solverInfo computes the set of cut and non-cut kvars, then initializes
     -- the solutions of the non-cut KVars (in the sHyp field)
     --
     -- S.init provides an initial solution for the cut KVars
-    sI  = solverInfo cfg fi
+    sI = solverInfo cfg fi
     wkl = W.init sI
-    s0  = (siSol sI) { Sol.sMap = S.init cfg fi ks }
-    ks  = siVars sI
-    elabQBind ctx msg env (Sol.QB xs) = Sol.QB (map elabEQual xs)
+    s0 = (siSol sI){Sol.sMap = S.init cfg fi ks}
+    ks = siVars sI
+    elabQBind elaborateQualifier (Sol.QB xs) = Sol.QB (map elabEQual xs)
       where
-        elabEQual eq =
-          eq { Sol.eqPred =
-                elaborate
-                 (ElabParam (T.ctxElabF ctx) (F.atLoc F.dummySpan msg) env)
-                 (Sol.eqPred eq)
-             }
-
+        elabEQual eq = eq{Sol.eqPred = elaborateQualifier (Sol.eqPred eq)}
 
 --------------------------------------------------------------------------------
 -- | Progress Bar
@@ -127,29 +124,31 @@ doInterpret cfg fi subcIds = liftIO $ instInterpreter cfg fi (Just subcIds)
 {-# SCC solve_ #-}
 solve_ :: (NFData a, F.Fixpoint a, F.Loc a)
        => Config
+       -> F.SInfo a
        -> S.HashSet F.Symbol
+       -> F.SourceScopes
        -> F.SInfo a
        -> Sol.Solution
        -> W.Worklist a
        -> SolveM a (F.Result (Integer, a), Stats)
 --------------------------------------------------------------------------------
-solve_ cfg scope fi s2 wkl = do
+solve_ cfg source scope sourceScopes fi s2 wkl = do
   liftSMT $ smtComment "solve: start"
   (s3, res0) <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bindingsInSmt -> do
     -- let s3   = solveEbinds fi s2
-    s3       <- {- SCC "sol-refine" -} refine scope bindingsInSmt (F.bs fi) s2 wkl
-    res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg fi (W.unsatCandidates wkl) s3
+    s3       <- {- SCC "sol-refine" -} refine scope bindingsInSmt fi s2 wkl
+    res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg sourceScopes fi (W.unsatCandidates wkl) s3
     return (s3, res0)
 
   (fi1, res1) <- case resStatus res0 of  {- first run the interpreter -}
-    Unsafe _ bads | rewriteAxioms cfg && interpreter cfg -> do
+    Unsafe _ bads | rewriteAxioms cfg && interpreter cfg && F.aenvNative (F.ae fi) == Nothing -> do
       liftSMT $ smtComment "solve: interpreter"
       bs <- doInterpret cfg fi (map fst $ mytrace ("before the Interpreter " ++ show (length bads) ++ " constraints remain") bads)
       let fi1 = fi { F.bs = bs }
           badCs = lookupCMap (F.cm fi) <$> map fst bads
       liftSMT $ smtComment "solve: pos-interpreter check"
       fmap (fi1,) $ sendConcreteBindingsToSMT F.emptyIBindEnv bs $ \bindingsInSmt ->
-        result scope bindingsInSmt cfg fi1 badCs s3
+        result scope bindingsInSmt cfg sourceScopes fi1 badCs s3
     _ -> return  (fi, mytrace "all checked before interpreter" res0)
 
   res2  <- case resStatus res1 of  {- then run normal PLE on remaining unsolved constraints -}
@@ -157,61 +156,35 @@ solve_ cfg scope fi s2 wkl = do
       when (save cfg) $
         liftIO $ S.saveSolution cfg ".pre-ple" res1
       liftSMT $ smtComment "solve: ple"
-      bs <- liftSMT $ PLE.instantiate cfg scope fi1 (Just s3) (Just $ map fst bads2)
+      bs <- liftSMT $ PLE.instantiate cfg source scope fi1 (Just s3) (Just $ map fst bads2)
       -- Check the constraints one last time after PLE
       let fi2 = fi { F.bs = bs }
           badsCs2 = lookupCMap (F.cm fi) <$> map fst bads2
       liftSMT $ smtComment "solve: pos-ple check"
       sendConcreteBindingsToSMT F.emptyIBindEnv bs $ \bindingsInSmt ->
-        result scope bindingsInSmt cfg fi2 badsCs2 s3
+        result scope bindingsInSmt cfg sourceScopes fi2 badsCs2 s3
     _ -> return $ mytrace "all checked with interpreter" res1
 
   liftSMT $ smtComment "solve: finished"
   st      <- stats
-  let res3 = {- SCC "sol-tidy" -} tidyResult cfg res2
-  return $!! (res3, st)
+  return $!! (res2, st)
 
 
 --------------------------------------------------------------------------------
--- | tidyResult ensures we replace the temporary kVarArg names introduced to
---   ensure uniqueness with the original names in the given WF constraints.
+{- | Project solutions in their canonical typed scope before choosing whether
+to retain casts. Presentation preserves the predicate's binding identities.
+-}
+
 --------------------------------------------------------------------------------
-tidyResult :: Config -> F.Result a -> F.Result a
-tidyResult _ r = r
-  { F.resSolution = tidySolution (F.resSolution r)
-  , F.resNonCutsSolution = M.map (fmap tidyPred) (F.resNonCutsSolution r)
-  , F.resSorts = fmap tidyBind <$>  F.resSorts r
-  }
-
-tidySolution :: F.FixSolution -> F.FixSolution
-tidySolution = fmap tidyPred
-
-tidyBind :: (F.Symbol, F.Sort) -> (F.Symbol, F.Sort)
-tidyBind (x, t) = (F.tidySymbol x, t)
-
-tidyPred :: F.Expr -> F.Expr
-tidyPred =  go
+tidyResult :: Config -> F.SEnv F.Sort -> F.Result a -> F.Result a
+tidyResult cfg declarations r =
+    r
+        { F.resSolution = M.mapWithKey project (F.resSolution r)
+        , F.resNonCutsSolution = M.mapWithKey (\k -> fmap (project k)) (F.resNonCutsSolution r)
+        }
   where
-    ts = F.tidySymbol
-    tb = tidyBind
-    go (F.EApp s e)      = F.EApp (go s) (go e)
-    go (F.ELam (x,t) e)  = F.ELam (ts x, t) (go e)
-    go (F.ECoerc a t e)  = F.ECoerc a t (go e)
-    go (F.ENeg e)        = F.ENeg (go e)
-    go (F.EBin op e1 e2) = F.EBin op (go e1) (go e2)
-    go (F.ELet x e1 e2)  = F.ELet (ts x) (go e1) (go e2)
-    go (F.EIte p e1 e2)  = F.EIte (go p) (go e1) (go e2)
-    go (F.ECst e so)     = F.ECst (go e) so
-    go (F.EVar x)        = F.EVar (ts x)
-    go (F.PAnd ps)       = F.PAnd $ map go ps
-    go (F.POr  ps)       = F.POr  $ map go ps
-    go (F.PNot p)        = F.PNot $ go p
-    go (F.PImp p1 p2)    = F.PImp (go p1) (go p2)
-    go (F.PIff p1 p2)    = F.PIff (go p1) (go p2)
-    go (F.PAtom r e1 e2) = F.PAtom r (go e1) (go e2)
-    go (F.PExist xts e)  = F.PExist (tb <$> xts) (go e)
-    go (F.PAll xts e)    = F.PAll   (tb <$> xts) (go e)
-    go  p                = p
+    project k = present . S.simplifyKVar declarations (F.fromListSEnv [(F.formalCanonical f, F.formalSort f) | f <- M.lookupDefault [] k (F.resScopes r)]) . unApply
+    present = if sortedSolution cfg then id else unElab
 
 --------------------------------------------------------------------------------
 {-# SCC refine #-}
@@ -223,58 +196,84 @@ refine
   :: forall a. F.Loc a
   => S.HashSet F.Symbol
   -> F.IBindEnv
-  -> F.BindEnv a
+  -> F.SInfo a
   -> Sol.Solution
   -> W.Worklist a
   -> SolveM a Sol.Solution
 --------------------------------------------------------------------------------
-refine scope bindingsInSmt be0 s0 w0 = go be0 s0 w0
-  where
-    go :: F.BindEnv a -> Sol.Solution -> W.Worklist a -> SolveM a Sol.Solution
-    go be s w
-      | Just (c, w', newScc, rnk) <- W.pop w = do
-         i       <- tickIter newScc
-         (b, s') <- refineC scope bindingsInSmt be i s c
-         lift $ writeLoud $ refineMsg i c b rnk (showpp s')
-         let w'' = if b then W.push c w' else w'
-         go be s' w''
-      | otherwise = return s
-      where
-        -- DEBUG
-        refineMsg i c b rnk s = printf "\niter=%d id=%d change=%s rank=%d s=%s\n"
-                                 i (F.subcId c) (show b) rnk s
+refine scope bindingsInSmt info s0 w0 = do
+  let initial = S.prepareSummaryState scope info
+  go initial s0 w0
+ where
+  go :: S.SummaryState -> Sol.Solution -> W.Worklist a -> SolveM a Sol.Solution
+  go initial s w
+    | Just (c, w', newScc, rnk) <- W.pop w = do
+        i <- tickIter newScc
+        (b, s') <- refineC initial scope bindingsInSmt info i s c
+        lift $ writeLoud $ refineMsg i c b rnk (showpp s')
+        let w'' = if b then W.push c w' else w'
+        go initial s' w''
+    | otherwise = return s
+   where
+    -- DEBUG
+    refineMsg i c b rnk s =
+      printf
+        "\niter=%d id=%d change=%s rank=%d s=%s\n"
+        i
+        (F.subcId c)
+        (show b)
+        rnk
+        s
 
 ---------------------------------------------------------------------------
 -- | Single Step Refinement -----------------------------------------------
 ---------------------------------------------------------------------------
 {-# SCC refineC #-}
-refineC
-  :: forall a. (F.Loc a)
-  => S.HashSet F.Symbol
-  -> F.IBindEnv
-  -> F.BindEnv a
-  -> Int
-  -> Sol.Solution
-  -> F.SimpC a
-  -> SolveM a (Bool, Sol.Solution)
+refineC ::
+    forall a.
+    (F.Loc a) =>
+    S.SummaryState ->
+    S.HashSet F.Symbol ->
+    F.IBindEnv ->
+    F.SInfo a ->
+    Int ->
+    Sol.Solution ->
+    F.SimpC a ->
+    SolveM a (Bool, Sol.Solution)
 ---------------------------------------------------------------------------
-refineC scope bindingsInSmt be _i s c =
-  do let krhs = rhsCands s
-     cfg <- T.config <$> getContext
-     if all (null . snd) krhs
-        then return (False, s)
-        else do
-          let lhs = S.lhsPred cfg scope bindingsInSmt be s c
-          kqs <- forM krhs $ \(k, rhs) ->
-            (,) k . Sol.QB <$> filterValid (cstrSpan c) lhs rhs
-          return $ S.update s kqs
+refineC initial scope bindingsInSmt info _i s c =
+    do
+        context <- getContext
+        let cfg = T.config context
+        let krhs = rhsCands cfg s
+        if all (null . snd) krhs
+            then return (False, s)
+            else do
+                let (definitions, lhs) = S.lhsPredShared cfg initial scope bindingsInSmt info s c
+                kqs <- forM krhs $ \(k, rhs) ->
+                    (,) k . Sol.QB <$> filterValid (cstrSpan c) definitions lhs rhs
+                return $ S.update s kqs
   where
-    rhsCands :: Sol.Solution -> [(F.KVar, Sol.Cand Sol.EQual)]
-    rhsCands s = M.toList $ M.fromList $ map cnd ks
+    rhsCands :: Config -> Sol.Solution -> [(F.KVar, Sol.Cand Sol.EQual)]
+    rhsCands cfg s = map cnd $ M.toList occurrences
       where
-        ks          = predKs . F.crhs $ c
-        cnd :: (F.KVar, F.Subst, F.TyVarSubst) -> (F.KVar , Sol.Cand Sol.EQual)
-        cnd (k, su, tvsu) = (k, S.qbPreds su tvsu (Sol.lookupQBind s k))
+        env = S.combinedEnv info scope (F.senv c) (F.srcSpan c) F.emptyIBindEnv mempty
+        ks = predKs . F.crhs $ c
+        occurrences = M.fromListWith (++) [(k, [(su, tvsu)]) | (k, su, tvsu) <- ks]
+        -- A retained qualifier must hold at every occurrence of its KVar.
+        -- Group actuals, not already-instantiated parallel qualifier lists.
+        cnd :: (F.KVar, [(F.Subst, F.TyVarSubst)]) -> (F.KVar, Sol.Cand Sol.EQual)
+        cnd (k, reversedActuals) =
+            ( k
+            , [ ( F.PAnd [S.applyExpr cfg env s p | (su, tvsu) <- actuals, (p, _) <- S.qbPreds su tvsu (Sol.QB [q])]
+                , q
+                )
+              | q <- qualifiers
+              ]
+            )
+          where
+            actuals = reverse reversedActuals
+            Sol.QB qualifiers = Sol.lookupQBind s k
 
 predKs :: F.Expr -> [(F.KVar, F.Subst, F.TyVarSubst)]
 predKs (F.PAnd ps)    = concatMap predKs ps
@@ -290,40 +289,50 @@ result
   => S.HashSet F.Symbol
   -> F.IBindEnv
   -> Config
+  -> F.SourceScopes
   -> F.SInfo a
   -> [F.SimpC a]
   -> Sol.Solution
   -> SolveM a (F.Result (Integer, a))
 --------------------------------------------------------------------------------
-result scope bindingsInSmt cfg fi cs s =
+result scope bindingsInSmt cfg sourceScopes fi cs s =
   sendConcreteBindingsToSMT bindingsInSmt be $ \bindingsInSmt2 -> do
     lift       $ writeLoud "Computing Result"
-    stat      <- result_ scope bindingsInSmt2 be cfg cs s
+    stat      <- result_ scope bindingsInSmt2 fi cfg cs s
     lift       $ whenLoud $ putStrLn $ "RESULT: " ++ show (F.sid <$> stat)
     resCut    <- solResult cfg s
-    let resNonCut = S.nonCutsResult cfg scope be s
-        resSorts = resultSorts fi (M.keys resCut ++ M.keys resNonCut) be
-    return     $ F.Result (ci <$> stat) resCut resNonCut resSorts
+    let resNonCut = S.nonCutsResult cfg scope fi s
+        scopes = either (Errors.die . Errors.err F.dummySpan . text) id $ resultScopes sourceScopes fi (M.keys resCut ++ M.keys resNonCut) be
+    return     $ F.Result (ci <$> stat) resCut resNonCut scopes
   where
     ci c = (F.subcId c, F.sinfo c)
     be = F.bs fi
 
-resultSorts :: F.SInfo a -> [F.KVar] -> F.BindEnv a -> F.ResultSorts
-resultSorts fi ks be = M.fromList
-  [(k, xts)
-    | k <- ks
-    , xts <- maybeToList (kvarScope fi be k) ]
-
-kvarScope :: F.SInfo a -> F.BindEnv a -> F.KVar -> Maybe [(F.Symbol, F.Sort)]
-kvarScope fi be k = do
-  w <- M.lookup k (F.ws fi)
-  let bs = F.wenv w
-  return $ F.wvvs w ++ [ bindInfo be i | i <- L.sort (F.elemsIBindEnv bs) ]
-
-bindInfo :: F.BindEnv a -> F.BindId -> (F.Symbol, F.Sort)
-bindInfo be i = (x, F.sr_sort sr)
+resultScopes :: F.SourceScopes -> F.SInfo a -> [F.KVar] -> F.BindEnv a -> Either String F.ResultScopes
+resultScopes sources fi ks be = M.fromList <$> traverse scope ks
   where
-    (x, sr, _) = F.lookupBindEnv i be
+    binders = M.fromList (F.bindEnvToList be)
+    scope k = do
+      w <- maybe (Left "result KVar has no WF") Right (M.lookup k (F.ws fi))
+      names <- maybe (Left "result KVar has no source scope") Right (M.lookup k sources)
+      bindings <- traverse (binding names) (L.sort $ F.elemsIBindEnv $ F.wenv w)
+      values <- traverse (uncurry (formal names)) (F.wvvs w)
+      normalized <- foldM insertFormal [] (values ++ bindings)
+      if S.fromList (map F.formalCanonical normalized) == M.keysSet names
+        then Right (k, reverse normalized)
+        else Left "source scope does not match result WF domain"
+    binding names i = do
+      (symbol, sr, _) <- maybe (Left "result WF binder is missing") Right (M.lookup i binders)
+      formal names symbol (F.sr_sort sr)
+    formal names canonical sort = do
+      source <- maybe (Left "result formal lacks a source") Right (M.lookup canonical names)
+      Right (F.Formal source canonical sort)
+    insertFormal seen candidate =
+      case L.find ((== F.formalCanonical candidate) . F.formalCanonical) seen of
+        Nothing -> Right (candidate : seen)
+        Just previous
+          | previous == candidate -> Right seen
+          | otherwise -> Left "result canonical formal has conflicting source or sort"
 
 solResult :: Config -> Sol.Solution -> SolveM ann (M.HashMap F.KVar F.Expr)
 solResult cfg = minimizeResult cfg . Sol.result
@@ -332,18 +341,19 @@ result_
   :: (F.Loc a, NFData a)
   => S.HashSet F.Symbol
   -> F.IBindEnv
-  -> F.BindEnv a
+  -> F.SInfo a
   -> Config
   -> [F.SimpC a]
   -> Sol.Solution
   -> SolveM a (F.FixResult (F.SimpC a))
-result_ scope bindingsInSmt be cfg cs0 s = do
-  unsatisfiedConstraints <- filterM (isUnsat scope bindingsInSmt be s) cs
-  sts      <- stats
+result_ scope bindingsInSmt info cfg cs0 s = do
+  let initial = S.prepareSummaryState scope info
+  unsatisfiedConstraints <- filterM (isUnsat initial scope bindingsInSmt info s) cs
+  sts <- stats
   pure $ res sts unsatisfiedConstraints
   where
-    cs          = isChecked cfg cs0
-    res sts []  = F.Safe sts
+    cs = isChecked cfg cs0
+    res sts [] = F.Safe sts
     res sts cs' = F.Unsafe sts cs'
 
 isChecked :: Config -> [F.SimpC a] -> [F.SimpC a]
@@ -378,18 +388,19 @@ minimizeConjuncts p = F.pAnd <$> go (F.conjuncts p) []
                               else go ps (p:acc)
 
 --------------------------------------------------------------------------------
-isUnsat
-  :: (F.Loc a, NFData a) => S.HashSet F.Symbol -> F.IBindEnv -> F.BindEnv a -> Sol.Solution -> F.SimpC a -> SolveM a Bool
+isUnsat ::
+    (F.Loc a, NFData a) => S.SummaryState -> S.HashSet F.Symbol -> F.IBindEnv -> F.SInfo a -> Sol.Solution -> F.SimpC a -> SolveM a Bool
 --------------------------------------------------------------------------------
-isUnsat scope bindingsInSmt be s c = do
-  -- lift   $ printf "isUnsat %s" (show (F.subcId c))
-  _     <- tickIter True -- newScc
-  cfg <- T.config <$> getContext
-  let lp = S.lhsPred cfg scope bindingsInSmt be s c
-      rp = rhsPred c
-  res   <- not <$> isValid (cstrSpan c) lp rp
-  lift   $ whenLoud $ showUnsat res (F.subcId c) lp rp
-  return res
+isUnsat initial scope bindingsInSmt info s c = do
+    -- lift   $ printf "isUnsat %s" (show (F.subcId c))
+    _ <- tickIter True -- newScc
+    context <- getContext
+    let cfg = T.config context
+        (definitions, lp) = S.lhsPredShared cfg initial scope bindingsInSmt info s c
+        rp = rhsPred c
+    res <- null <$> filterValid (cstrSpan c) definitions lp [(rp, ())]
+    lift $ whenLoud $ showUnsat res (F.subcId c) lp rp
+    return res
 
 showUnsat :: Bool -> Integer -> F.Pred -> F.Pred -> IO ()
 showUnsat u i lP rP = {- when u $ -} do
@@ -409,7 +420,7 @@ rhsPred c
 --------------------------------------------------------------------------------
 isValid :: F.SrcSpan -> F.Expr -> F.Expr -> SolveM ann Bool
 --------------------------------------------------------------------------------
-isValid sp p q = not . null <$> filterValid sp p [(q, ())]
+isValid sp p q = not . null <$> filterValid sp [] p [(q, ())]
 
 cstrSpan :: (F.Loc a) => F.SimpC a -> F.SrcSpan
 cstrSpan = F.srcSpan . F.sinfo

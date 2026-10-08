@@ -1,6 +1,6 @@
 
-// Due to a quirk of Z3, adding an extra "junk" ctor that uses the @(0) ty-var makes this ok, specifically,
-//  | junk  { fjunk    : @(0) }
+// A phantom parameter must not introduce any additional constructors.
+// Observe both parameter instances rather than just declaring their sorts.
 
 data Boo 1 = [
   | bling { booFirst : int  }
@@ -20,3 +20,15 @@ constraint:
   lhs {v : int | v = z + 1 }
   rhs {v : int | v < 20    }
   id 1 tag []
+
+constraint:
+  env [1;2]
+  lhs {v : int | true }
+  rhs {v : int | is$bling x && is$bling y }
+  id 2 tag []
+
+constraint:
+  env [1;2]
+  lhs {v : int | true }
+  rhs {v : int | x = bling (booFirst x) && y = bling (booFirst y) }
+  id 3 tag []

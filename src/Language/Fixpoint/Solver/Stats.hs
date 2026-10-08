@@ -17,9 +17,9 @@ import Data.Aeson
 data Stats = Stats
   { numCstr      :: !Int -- ^ # Horn Constraints
   , numIter      :: !Int -- ^ # Refine Iterations
-  , numBrkt      :: !Int -- ^ # smtBracket    calls (push/pop)
+  , numBrkt      :: !Int -- ^ # candidate-filter scopes
   , numChck      :: !Int -- ^ # smtCheckUnsat calls
-  , numVald      :: !Int -- ^ # times SMT said RHS Valid
+  , numVald      :: !Int -- ^ # candidate implications proved
   } deriving (Data, Show, Generic, Eq)
 
 instance NFData Stats
@@ -29,8 +29,8 @@ instance Serialize Stats
 instance F.PTable Stats where
   ptable s = F.DocTable [ (text "# Constraints"                       , F.pprint (numCstr      s))
                         , (text "# Refine Iterations"                 , F.pprint (numIter      s))
-                        , (text "# SMT Brackets"                      , F.pprint (numBrkt      s))
-                        , (text "# SMT Queries (Valid)"               , F.pprint (numVald      s))
+                        , (text "# Candidate-filter Scopes"           , F.pprint (numBrkt      s))
+                        , (text "# Candidate Implications Proved"     , F.pprint (numVald      s))
                         , (text "# SMT Queries (Total)"               , F.pprint (numChck      s))
                         ]
 

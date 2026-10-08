@@ -1,0 +1,12 @@
+// Equality and argument instantiation must refer to the same undef@Token.
+data Token 0 = [ | First {} | Second {} ]
+constant undef : func(1, [@(0)])
+constant consume : func(0, [Token; int])
+bind 0 witness : {v : Token | v = undef}
+bind 1 result : {v : int | v = consume witness}
+
+constraint:
+  env [0; 1]
+  lhs {v : int | v = result}
+  rhs {v : int | v = consume undef}
+  id 0 tag []
