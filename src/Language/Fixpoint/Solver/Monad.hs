@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 -- | This is a wrapper around IO that permits SMT queries
 
@@ -29,7 +30,7 @@ module Language.Fixpoint.Solver.Monad
        )
        where
 
-import           Control.Monad (forM_, when)
+import           Control.Monad (forM, forM_, when)
 import           Language.Fixpoint.Utils.Progress
 import qualified Language.Fixpoint.Types.Config  as C
 import           Language.Fixpoint.Types.Config  (Config)
@@ -39,10 +40,10 @@ import qualified Language.Fixpoint.Types   as F
 import qualified Language.Fixpoint.Types.Solutions as F
 import qualified Language.Fixpoint.Types.Visitor as F
 -- import qualified Language.Fixpoint.Types.Errors  as E
-import           Language.Fixpoint.Smt.Serialize (freshSmtSymbols)
+import           Language.Fixpoint.Smt.Serialize ()
 import           Language.Fixpoint.Types.PrettyPrint ()
 import           Language.Fixpoint.Smt.Interface
-import           Language.Fixpoint.Smt.Types (SmtM, liftSym)
+import           Language.Fixpoint.Smt.Types (SmtM)
 -- import qualified Language.Fixpoint.Smt.Theories as Thy
 import           Language.Fixpoint.Solver.Sanitize
 import           Language.Fixpoint.Solver.Stats
@@ -53,10 +54,9 @@ import           Language.Fixpoint.Graph.Types (SolverInfo (..))
 import qualified Control.Monad.State as ST
 import           Control.Monad.State.Strict
 import qualified Data.HashMap.Strict as M
-import qualified Data.HashSet as S
+import           Data.Maybe (catMaybes)
 import           Control.Exception.Base (bracket)
 import Language.Fixpoint.SortCheck (ElabParam)
-import Text.PrettyPrint.HughesPJ.Compat (text)
 
 --------------------------------------------------------------------------------
 -- | Solver Monadic API --------------------------------------------------------
@@ -170,69 +170,36 @@ filterRequired :: F.Cand a -> F.Expr -> SolveM ann [a]
 filterRequired = error "TBD:filterRequired"
 
 --------------------------------------------------------------------------------
-{- | Return candidates whose implication is proved in the query's authorized
-theory, preserving input order. An incomplete solver may omit valid members.
-This pointwise strategy proves one member per check or shares its countermodel
-with the remaining candidates. It checks each member of an all-valid group.
--}
-
+-- | `filterValid p [(q1, x1),...,(qn, xn)]` returns the list `[ xi | p => qi]`;
+--   the query's eliminated `definitions` are in scope for every check.
 --------------------------------------------------------------------------------
 {-# SCC filterValid #-}
 filterValid :: F.SrcSpan -> [F.Equation] -> F.Expr -> F.Cand a -> SolveM ann [a]
 --------------------------------------------------------------------------------
 filterValid sp definitions p qs = do
-    (qs', checks) <- liftSMT $
-        smtBracket "filterValidLHS" $ do
-            forM_ definitions $ \equation ->
-                smtDefineFunc (F.eqName equation) (F.eqArgs equation) (F.eqSort equation) (F.eqBody equation)
-            filterValid_ sp definitions p qs
-    -- stats
-    incBrkt
-    incChck checks
-    incVald (length qs')
-    return qs'
+  qs' <- liftSMT $
+           smtBracket "filterValidLHS" $ do
+             forM_ definitions $ \F.Equ{..} -> smtDefineFunc eqName eqArgs eqSort eqBody
+             filterValid_ sp p qs
+  -- stats
+  incBrkt
+  incChck (length qs)
+  incVald (length qs')
+  return qs'
 
 {-# SCC filterValid_ #-}
-filterValid_ :: F.SrcSpan -> [F.Equation] -> F.Expr -> F.Cand a -> SmtM ([a], Int)
-filterValid_ sp definitions p qs = do
-    smtAssert p
-    names <- liftSym (freshSmtSymbols (p : map fst qs ++ concatMap (\equation -> [F.EVar (F.eqName equation), F.eqBody equation]) definitions) (length qs))
-    -- Names abbreviate candidates, rather than adding constraints on models.
-    -- Expanding them recovers the original query and retains native support.
-    forM_ (zip names qs) $ \(name, (predicate, _)) ->
-        smtDefineFunc name [] F.boolSort predicate
-    go (zip names qs)
-  where
-    go [] = pure ([], 0)
-    go candidates@((first, (_, payload)) : rest) = do
-        observation <- observe first candidates
-        let refuted = falseNames observation
-            remaining = case observation of
-                Unsat -> rest
-                -- An incomplete proof omits only the current member.
-                Unknown -> rest
-                -- Only SAT requests model values. SAT itself refutes first,
-                -- even when those values are opaque or unsupported.
-                _ -> filter (not . (`S.member` refuted) . fst) rest
-        (retained, checks) <- go remaining
-        let accepted = case observation of
-                Unsat -> payload : retained
-                _ -> retained
-        pure (accepted, 1 + checks)
-    observe first candidates = smtBracketAt sp "filterValidRHS" $ do
-        smtAssert (F.PNot (F.EVar first))
-        response <- command CheckSat
-        case response of
-            Sat -> command (GetValue (map fst candidates))
-            Unsat -> pure Unsat
-            Unknown -> pure Unknown
-            _ -> F.die $ F.err F.dummySpan $ text ("crash: SMTLIB2 respSat = " ++ show response)
-    falseNames (Values values) = S.fromList [name | (name, "false") <- values]
-    falseNames _ = S.empty
+filterValid_ :: F.SrcSpan -> F.Expr -> F.Cand a -> SmtM [a]
+filterValid_ sp p qs = catMaybes <$> do
+  smtAssert p
+  forM qs $ \(q, x) ->
+    smtBracketAt sp "filterValidRHS" $ do
+      smtAssert (F.PNot q)
+      valid <- smtCheckUnsat
+      return $ if valid then Just x else Nothing
 
 smtEnablembqi :: SolveM ann ()
-smtEnablembqi =
-  liftSMT smtSetMbqi
+smtEnablembqi
+  = liftSMT smtSetMbqi
 
 --------------------------------------------------------------------------------
 assumesAxioms :: [F.Triggered F.Expr] -> SolveM ann ()

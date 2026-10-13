@@ -149,7 +149,7 @@ emptySliceTests =
 filterValidTests :: TestTree
 filterValidTests =
     testGroup
-        "pointwise validity filtering with shared countermodels"
+        "pointwise validity filtering"
         [ testGroup
             (show solver)
             [ testCase "pointwise proofs preserve 32 ordered duplicate payloads" $ do
@@ -161,14 +161,6 @@ filterValidTests =
                 actual @?= map snd candidates
                 Stats.numChck counters @?= 32
                 Stats.numVald counters @?= length candidates
-            , testCase "one countermodel rejects every invalid group member" $ do
-                let candidates = [(F.PAtom F.Lt x (integer (-index)), index) | index <- [1 .. 16]]
-                (actual, counters) <- withFilterSolver solver $ do
-                    accepted <- SM.filterValid F.dummySpan [] lhs candidates
-                    counters <- SM.stats
-                    pure (accepted, counters)
-                actual @?= []
-                Stats.numChck counters @?= 1
             , testCase "mixed results agree with pointwise checks and retain order and duplicates" $ do
                 let candidates :: [(F.Expr, Int)]
                     candidates = [(F.PAtom F.Ge x (integer 0), 4), (F.PAtom F.Gt x (integer 0), 9), (b, 4), (F.PNot b, 7), (F.PAtom F.Eq x x, 2), (F.PAtom F.Le x (integer 0), 4), (F.PTrue, 2)]

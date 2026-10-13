@@ -556,8 +556,12 @@ smtAssertAxiom p  = interact' (AssertAx p)
 smtDistinct :: [Expr] -> SmtM ()
 smtDistinct az = interact' (Distinct az)
 
+-- | An error reply fails this action, inside the caller's bracket and span;
+--   a lazy 'respSat' would defer it to whoever forces the answer.
 smtCheckUnsat :: HasCallStack => SmtM Bool
-smtCheckUnsat = respSat <$> command CheckSat
+smtCheckUnsat = do
+  response <- command CheckSat
+  pure $! respSat response
 
 smtBracketAt :: SrcSpan -> String -> SmtM a -> SmtM a
 smtBracketAt sp _msg a =

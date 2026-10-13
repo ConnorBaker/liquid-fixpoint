@@ -13,7 +13,6 @@ import Data.List (isInfixOf, nub)
 import qualified Data.Store as Store
 import qualified Data.Text as T
 import qualified Language.Fixpoint.Smt.Interface as SMT
-import qualified Language.Fixpoint.Smt.Serialize as Serialize
 import qualified Language.Fixpoint.Smt.Theories as Thy
 import qualified Language.Fixpoint.Solver.Common as Common
 import qualified Language.Fixpoint.SortCheck as Check
@@ -46,7 +45,6 @@ freshnessTests =
             [ ("apply carrier", T.unpack <$> F.symbolAtName F.applyName (F.FFunc F.FInt F.FInt))
             , ("value instance", render (F.ECst (F.EVar "family") F.FInt))
             , ("lexical binder", render (F.PAll [("bound", F.FInt)] (F.PAtom F.Eq (F.EVar "bound") (F.expr (0 :: Integer)))))
-            , ("candidate value", show <$> Serialize.freshSmtSymbols [] 1)
             ]
         , exhausted <- [False, True]
         ]

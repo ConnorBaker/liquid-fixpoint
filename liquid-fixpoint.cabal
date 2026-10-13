@@ -231,7 +231,7 @@ test-suite tasty
                     ConfiguredStringTests
                     EtaFreshnessTests
                     InterpretTests
-                    ModelFilterTests
+                    ValidityFilterTests
                     NativeCallableTests
                     NestedKVarActualTests
                     EliminatedSharingTests

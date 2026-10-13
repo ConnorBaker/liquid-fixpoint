@@ -8,7 +8,7 @@ import qualified ConfiguredStringTests
 import qualified EliminatedSharingTests
 import qualified EtaFreshnessTests
 import qualified InterpretTests
-import qualified ModelFilterTests
+import qualified ValidityFilterTests
 import qualified NativeCallableTests
 import qualified NestedKVarActualTests
 import qualified PLEAuthorityTests
@@ -38,7 +38,7 @@ main =
             , SimplifyKVarTests.tests
             , SolutionPresentationTests.tests
             , InterpretTests.tests
-            , ModelFilterTests.tests
+            , ValidityFilterTests.tests
             , UndoANFTests.tests
             , ScopedSubstitutionTests.tests
             , SortInventoryTests.tests

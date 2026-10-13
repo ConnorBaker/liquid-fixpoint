@@ -12,10 +12,10 @@
 --   typeclass. We split it into a separate module as it depends on
 --   Theories (see @smt2App@).
 
-module Language.Fixpoint.Smt.Serialize (smt2SortMono, nativeFunctionAxioms, freshSmtSymbols) where
+module Language.Fixpoint.Smt.Serialize (smt2SortMono, nativeFunctionAxioms) where
 
 import           Control.Monad.State
-import Control.Monad (forM, guard, replicateM, when)
+import Control.Monad (forM, guard, when)
 import           Data.ByteString.Builder (Builder, intDec)
 import           Language.Fixpoint.SortCheck
 import           Language.Fixpoint.Types
@@ -170,20 +170,6 @@ lexicalNames bound expressions = do
     rawLiteral strings spelling _ (ESym constant) | not strings = spelling (symbol constant)
     rawLiteral _ _ _ (ECon (L raw sort)) | not (isString sort) = [raw]
     rawLiteral _ _ _ _ = []
-
--- Allocate ordinary identifiers from the same scoped supply as native value
--- instances and lexical binders. Reserve the complete support before allocation;
--- raw theory/literal fragments need the same conservative wire-name check.
-freshSmtSymbols :: [Expr] -> Int -> SymM [Symbol]
-freshSmtSymbols expressions count = do
-    environment <- get
-    (_, literals) <- lexicalNames [] expressions
-    let occupied = syms expressions <> HS.fromList (map fst (toListSEnv (seSort environment) ++ toListSEnv (tsSort <$> seTheory environment)))
-        raw = literals ++ map (tsRaw . snd) (toListSEnv (seTheory environment))
-        available index = not (HS.member name occupied || any (symbolSmtText name `T.isInfixOf`) raw)
-          where
-            name = intSymbol "lq_candidate_value" index
-    replicateM count (intSymbol "lq_candidate_value" <$> freshSmtIndex available)
 
 -- Term binders live in this lexical map, not in seSort: they cannot redefine
 -- a declaration's FObj coordinates or acquire a same-spelled theory meaning.
