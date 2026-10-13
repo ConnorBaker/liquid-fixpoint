@@ -1,5 +1,6 @@
 -- | Validate and Transform Constraints to Ensure various Invariants -------------------------
 --   1. Each binder must be associated with a UNIQUE sort
+{-# LANGUAGE PatternGuards     #-}
 {-# LANGUAGE TupleSections     #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleContexts #-}

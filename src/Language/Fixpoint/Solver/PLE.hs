@@ -1748,13 +1748,13 @@ checkedSelectUnfolding _ _ _ expression = return (expression, False)
 checkedElaborateExprAs :: Knowledge -> String -> Expr -> Maybe Sort -> MaybeT (StateT EvalEnv IO) Expr
 checkedElaborateExprAs γ msg e expected = MaybeT $ do
   let elabSpan = atLoc dummySpan msg
-  (symEnv, bindings) <- scopedEvalEnv γ
+  (scopeEnv, bindings) <- scopedEvalEnv γ
   ef <- gets evElabF
   let localNames = map fst (toListSEnv bindings)
-      scoped = symEnv{seTheory = foldr deleteSEnv (seTheory symEnv) localNames}
+      scoped = scopeEnv{seTheory = foldr deleteSEnv (seTheory scopeEnv) localNames}
   pure $
     either (const Nothing) (Just . unApply . SortCheck.elabApply scoped) $
-      SortCheck.elabExprEAt ef symEnv bindings elabSpan expected e
+      SortCheck.elabExprEAt ef scopeEnv bindings elabSpan expected e
 
 -- | Returns False if there is a fuel count in the evaluation environment and
 -- the fuel count exceeds the maximum. Returns True otherwise.

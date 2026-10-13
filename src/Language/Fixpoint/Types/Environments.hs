@@ -77,7 +77,6 @@ import           Control.DeepSeq
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Binders
 import           Language.Fixpoint.Types.Names
-import           Language.Fixpoint.Types.Sorts
 import           Language.Fixpoint.Types.Refinements
 import           Language.Fixpoint.Types.Substitutions ()
 import           Language.Fixpoint.Misc

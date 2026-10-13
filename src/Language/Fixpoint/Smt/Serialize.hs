@@ -15,7 +15,6 @@
 module Language.Fixpoint.Smt.Serialize (smt2SortMono, nativeFunctionAxioms, freshSmtSymbols) where
 
 import           Control.Monad.State
-import           Control.Applicative ((<|>))
 import Control.Monad (forM, guard, replicateM, when)
 import           Data.ByteString.Builder (Builder, intDec)
 import           Language.Fixpoint.SortCheck

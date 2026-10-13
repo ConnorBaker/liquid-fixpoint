@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE CPP               #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TupleSections #-}
@@ -536,19 +537,19 @@ sharedCube select cfg original solution occurrence cube = do
                 lookupSort name = F.lookupSEnv name available `mplus` F.lookupSEnv name parameterSorts
                 free = F.syms predicate
                 -- Fixed globals retain their occurrence-specific instances.
-                local name = F.memberSEnv name (ceLocalSorts environment) || S.member name formals
-                parameters = List.sort [(name, sort) | name <- S.toList free, local name, sort <- maybeToList (lookupSort name)]
+                isLocal name = F.memberSEnv name (ceLocalSorts environment) || S.member name formals
+                parameters = List.sort [(name, sort) | name <- S.toList free, isLocal name, sort <- maybeToList (lookupSort name)]
                 missing = [name | name <- S.toList free, S.member name formals, isNothing (lookupSort name)]
             when (not (null missing)) $
                 Misc.errorstar ("lhsPredShared requires normalized typed formals: " ++ show missing)
             definitions <- St.gets summaryBodies
             let definedSort equation = foldr F.FFunc (F.eqSort equation) (map snd (F.eqArgs equation))
                 declarations = F.fromListSEnv [(F.eqName equation, definedSort equation) | equation <- M.elems definitions] <> declarationSEnv environment
-                locals = F.fromListSEnv parameters <> ceLocalSorts environment
+                localSorts = F.fromListSEnv parameters <> ceLocalSorts environment
                 -- Build the complete witness relation first. Projection then
                 -- substitutes only checked defining equalities, preserving
                 -- every witness constraint without duplicating equal calls.
-                projected = simplifyKVar declarations locals predicate
+                projected = simplifyKVar declarations localSorts predicate
             name <- recordSummary original parameters projected
             let value = F.eApps (F.EVar name) (map (F.EVar . fst) parameters)
             St.modify (\state -> state{summaryCubes = Ordered.insert key value (summaryCubes state)})

@@ -364,7 +364,7 @@ smt2App env declaration selected arguments =
     resultSort poly = smt2SmtSort (sortSmtSort poly env (ffuncOut selected))
     function
         | tsInterp declaration == Ctor
-        , isPolyInst (tsSort declaration) selected =
+        && isPolyInst (tsSort declaration) selected =
             key2 "as" (fromText (tsRaw declaration)) (resultSort False)
         | otherwise = fromText (tsRaw declaration)
 

@@ -915,11 +915,11 @@ elabRaw !f (PAtom !r !e1 !e2)
       checkURel (PAtom r e1 e2) s1 s2
       return (PAtom r e1' e2', boolSort)
 elabRaw f@(!environment, !_) original@(PAtom !r !e1 !e2) = do
-  first@(!e1', !s1) <- elab f e1
-  second@(!e2', !s2) <- elab f e2
+  firstPair@(!_, !s1) <- elab f e1
+  second@(!_, !s2) <- elab f e2
   checkRelTy original r s1 s2
   let operand pair = maybe (fst pair) (\env -> uncurry (toInt env) pair) environment
-  return (PAtom r (operand first) (operand second), boolSort)
+  return (PAtom r (operand firstPair) (operand second), boolSort)
 elabRaw !f (PExist !bs !e) = do
   bs' <- traverse (traverse annotationSort) bs
   e' <- elabPred (elabAddEnv f bs') e
@@ -1191,8 +1191,8 @@ exprSortMaybe expression =
     go (ECst _ s) = return s
     go (ELam (_, sx) e) = FFunc sx <$> go e
     go application@(EApp function argument) = do
-        functionSort <- go function >>= resolveSort >>= instantiate
-        case functionSort of
+        calleeSort <- go function >>= resolveSort >>= instantiate
+        case calleeSort of
             FFunc domain result -> do
                 argumentSort <- go argument
                 solution <- assignSort (Just application) domain argumentSort
