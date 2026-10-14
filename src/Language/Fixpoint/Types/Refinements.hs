@@ -657,7 +657,7 @@ instance (Ord b, Fixpoint b, Hashable b, Ord v, Fixpoint v) => Fixpoint (ExprBV 
                                         $+$ ("." <+> toFix p))
   toFix (ETApp e s)      = text "tapp" <+> toFix e <+> toFix s
   toFix (ETAbs e s)      = text "tabs" <+> toFix e <+> toFix s
-  toFix (ECoerc a t e)   = parens (text "coerce" <+> toFix a <+> text "~" <+> toFix t <+> text "in" <+> toFix e)
+  toFix (ECoerc a t e)   = parens (text "coerce" <+> parens (toFix a <+> text "~" <+> toFix t) <+> parens (toFix e))
   toFix (ELam (x,s) e)   = parens (char '\\' <+> toFix x <+> ":" <+> toFix s <+> "->" <+> toFix e)
 
   simplify = simplifyExprDefault
