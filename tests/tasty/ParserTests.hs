@@ -107,6 +107,12 @@ testSortP =
     , testCase "Coerce0" $
         show (doParse' predP "test" "v = (coerce (a ~ int) (f x))")
           @?= "PAtom Eq (EVar \"v\") (ECoerc (FObj \"a\") FInt (EApp (EVar \"f\") (EVar \"x\")))"
+
+    -- A saved query is re-read by the same parser: printing a coercion must
+    -- produce syntax that parses back to the same expression.
+    , testCase "Coerce round trip" $
+        let parsed = doParse' predP "test" "v = (coerce (a ~ int) (f x))"
+         in doParse' predP "test" (showFix parsed) @?= parsed
     ]
 
 -- ---------------------------------------------------------------------
