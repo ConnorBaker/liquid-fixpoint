@@ -102,6 +102,12 @@ tests =
             ++ [ testCase ("defining type substitution cut " ++ show instantiated) (indexedDefinitionCut instantiated)
                | instantiated <- [False, True]
                ]
+            ++ [ testCase "vacuous defining type substitution eliminates" vacuousInstantiationEliminates
+               ]
+            ++ [ testCase ("vacuous defining type substitution " ++ show mode ++ " conclusion " ++ show conclusion) (vacuousInstantiationResult mode conclusion)
+               | mode <- [C.Some, C.All]
+               , conclusion <- [False, True]
+               ]
             ++ [ SummaryScopeTests.tests
                , testCase "exported solution closes common locals, not formals or globals" (forM_ [False, True] exportedSolution)
                , testCase "defining-only ordinary global stays fixed" (globalElimination "empty" (polymorphicGlobalQuery False F.Eq) C.Some F.Eq)
@@ -887,6 +893,47 @@ indexedDefinitionQuery instantiated conclusion =
         , mkConstraint 2 (F.fromListIBindEnv [2]) F.boolSort (occurrence mempty "y") (if conclusion then F.PTrue else F.PFalse)
         , mkConstraint 3 mempty F.FInt zero independent
         , mkConstraint 4 mempty F.FInt independent zero
+        ]
+
+vacuousInstantiationEliminates :: Assertion
+vacuousInstantiationEliminates = do
+    (_, _, prepared, _) <- Solver.simplifyFInfo config (vacuousInstantiationQuery False)
+    let (_, dependencies) = Graph.elimVars config prepared
+    assertBool "a vacuous instantiation needs no cut" (S.member (kvar 0) (Graph.depNonCuts dependencies))
+  where
+    config = cfg{C.eliminate = C.Some, C.cores = Just 1}
+
+-- No qualifier can state the defined value, so only the exact Cube proves
+-- the consumer; a false conclusion must still fail at the consumer.
+vacuousInstantiationResult :: C.Eliminate -> Bool -> Assertion
+vacuousInstantiationResult mode conclusion = do
+    result <- Solver.solve cfg{C.eliminate = mode, C.cores = Just 1} (vacuousInstantiationQuery conclusion)
+    case (conclusion, F.resStatus result) of
+        (True, F.Safe _) -> pure ()
+        (False, F.Unsafe _ owners) -> map fst owners @?= [2]
+        _ -> assertFailure ("unexpected vacuous instantiation result: " ++ show (F.resStatus result))
+
+-- The defining occurrence instantiates a type variable that no parameter
+-- sort of K names, as when a polymorphic constructor is applied at a
+-- monomorphic element: K's context, and so its Cube, are unchanged.
+vacuousInstantiationQuery :: Bool -> F.FInfo ()
+vacuousInstantiationQuery conclusion =
+    mempty
+        { F.bs =
+            F.bindEnvFromList
+                [ binding 0 "formal" F.FInt F.PTrue
+                , binding 1 "x" F.FInt (F.EEq (var "x") (int 5))
+                , binding 2 "y" F.FInt F.PTrue
+                ]
+        , F.hoInfo = F.cfgHoInfo cfg
+        , F.cm = M.fromList [(F.subcId constraint, constraint) | constraint <- constraints]
+        , F.ws = M.fromList [(kvar 0, F.WfC (F.fromListIBindEnv [0]) [("vv", F.boolSort)] (kvar 0) ())]
+        }
+  where
+    occurrence types actual = F.PKVar (kvar 0) types (F.toKVarSubst (M.singleton "formal" (var actual)))
+    constraints =
+        [ mkConstraint 1 (F.fromListIBindEnv [1]) F.boolSort F.PTrue (occurrence (M.singleton "element" F.FInt) "x")
+        , mkConstraint 2 (F.fromListIBindEnv [2]) F.boolSort (occurrence mempty "y") (F.EEq (var "y") (int (if conclusion then 5 else 6)))
         ]
 
 mkConstraint :: Integer -> F.IBindEnv -> F.Sort -> F.Expr -> F.Expr -> F.SubC ()

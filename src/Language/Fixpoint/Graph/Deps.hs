@@ -43,6 +43,7 @@ import           Control.Monad             (when)
 import qualified Data.HashSet                         as S
 import qualified Data.List                            as L
 import qualified Data.HashMap.Strict                  as M
+import qualified Data.HashMap.Lazy                    as ML
 import qualified Data.Graph                           as G
 import           Data.Function (on)
 import           Data.Hashable
@@ -360,13 +361,25 @@ edgeDeps cfg si =
   -- It cannot invert a defining type instantiation or interpret an actual
   -- that depends on the evolving solution. Keep those original constraints
   -- in occurrence-typed inference; do not approximate their entire component.
+  -- Instantiating a type variable that no parameter sort of the KVar names
+  -- leaves that context unchanged: there is nothing to invert, and the Cube
+  -- is exact, as upstream eliminates it.
   retainedDefinitions =
     S.fromList
       [ k
       | c <- M.elems (F.cm si)
       , F.PKVar k types su <- F.splitPAnd (F.crhs c)
-      , any (\(name, sort) -> sort /= F.FObj name) (M.toList types)
+      , any (instantiatesContext k) (M.toList types)
           || any (not . M.null . F.exprKVars) (M.elems (F.fromKVarSubst su))
+      ]
+  instantiatesContext k (name, sort) =
+    sort /= F.FObj name && maybe True (S.member name) (M.lookup k contextTypeVariables)
+  -- Lazy: computed once, and only for KVars defined at a type instantiation.
+  contextTypeVariables = ML.map parameterTypeVariables (F.ws si)
+  parameterTypeVariables w =
+    S.unions
+      [ F.sortSymbols sort
+      | sort <- map snd (F.wvvs w) ++ [F.sr_sort reft | i <- F.elemsIBindEnv (F.wenv w), let (_, reft, _) = F.lookupBindEnv i (F.bs si)]
       ]
   nlKs
     | nonLinCuts cfg = nonLinearKVars si
