@@ -40,6 +40,16 @@ tests =
                     Right expression -> do
                         assertBool "fresh result coordinate missing" (not (S.null (C.sortFieldIndices expression)))
                         S.intersection (C.sortFieldIndices (base, local)) (C.sortFieldIndices expression) @?= S.empty
+            , testCase "a judgment's solution grows in proportion to its instances" $ do
+                let bindings = F.fromListSEnv [("poly", F.FAbs 42 (F.FFunc (F.FVar 42) F.boolSort))]
+                    measure count = do
+                        let input :: F.Expr
+                            input = F.PAnd [F.EApp (F.EVar "poly") (F.ECon (F.I index)) | index <- [1 .. count]]
+                        _ <- evaluate (force input)
+                        allocationBytes (either (error . show) id (C.annotateExprEAt flags Nothing bindings "instances" (Just F.boolSort) input))
+                small <- measure (250 :: Integer)
+                large <- measure 2000
+                assertBool ("solving instances grew superlinearly: " ++ show (small, large)) (large <= 16 * small + 1048576)
             , testCase "local declarations shadow base lookup" $ do
                 let base = F.fromListSEnv [("value", F.FInt)]
                     local = F.fromListSEnv [("value", F.boolSort)]
