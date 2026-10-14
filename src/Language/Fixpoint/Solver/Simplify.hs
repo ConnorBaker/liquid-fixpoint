@@ -74,7 +74,7 @@ applyConstantFolding bop' e1 e2 =
       | bop' == bop1 -> maybe e (EBin bop' e11) (cfR (rop bop') (fromIntegral left) right)
       | otherwise   -> e
     (EBin bop1 e11 (dropECst -> ECon (I left)), ECon (I right))
-      | bop' == bop1 -> maybe e (EBin bop' e11) (cfI (rop bop') left right)
+      | bop' == bop1, nests bop' left right -> maybe e (EBin bop' e11) (cfI (rop bop') left right)
       | otherwise   -> e
     _ -> e
   where
@@ -90,6 +90,12 @@ applyConstantFolding bop' e1 e2 =
 
     e = EBin bop' e1 e2
 
+    -- SMT-LIB div is Euclidean: (x div a) div b == x div (a * b) holds for
+    -- a > 0 but not for a < 0, and a zero divisor stays uninterpreted.
+    nests :: Bop -> Integer -> Integer -> Bool
+    nests Div left right = left > 0 && right /= 0
+    nests _ _ _ = True
+
     getOp :: Num a => Bop -> Maybe (a -> a -> a)
     getOp Minus    = Just (-)
     getOp Plus     = Just (+)
@@ -97,18 +103,11 @@ applyConstantFolding bop' e1 e2 =
     getOp RTimes   = Just (*)
     getOp _        = Nothing
 
+    -- SMT reals are exact and have no NaN or infinity, so a Double result
+    -- is not a sound replacement for a real operation. Leave real constants
+    -- to the solver.
     cfR :: Bop -> Double -> Double -> Maybe Expr
-    cfR bop left right = go (getOp' bop)
-      where
-        go (Just f) =
-          let x = f left right
-           in if isNaN x || isInfinite x then Just $ ECon (R x)
-              else Nothing
-        go Nothing = Nothing
-
-        getOp' Div  | right /= 0 = Just (/)
-        getOp' RDiv | right /= 0 = Just (/)
-        getOp' op = getOp op
+    cfR _ _ _ = Nothing
 
     cfI :: Bop -> Integer -> Integer -> Maybe Expr
     cfI bop left right = fmap go (getOp' bop)
