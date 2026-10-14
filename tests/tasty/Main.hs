@@ -15,6 +15,7 @@ import qualified PLEAuthorityTests
 import qualified ParserTests
 import qualified PolyFamilyTests
 import qualified QueryAuthorityTests
+import qualified RecoveredRegressionTests
 import qualified RootSortCheckTests
 import qualified ScopedSubstitutionTests
 import qualified ShareMapTests
@@ -55,4 +56,5 @@ main =
             , QueryAuthorityTests.tests
             , RootSortCheckTests.tests
             , EtaFreshnessTests.tests
+            , RecoveredRegressionTests.tests
             ]
