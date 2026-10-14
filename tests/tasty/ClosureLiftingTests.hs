@@ -8,6 +8,7 @@ import Control.Monad.State.Lazy (evalState)
 import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy as Bytes
 import qualified Data.HashMap.Strict as M
+import qualified Data.HashSet as S
 import EliminatedSharingSupport
 import qualified EliminatedSharingTests as Sharing
 import Language.Fixpoint.Smt.Serialize ()
@@ -16,6 +17,7 @@ import qualified Language.Fixpoint.Solver as Solver
 import qualified Language.Fixpoint.Solver.Sanitize as Sanitize
 import qualified Language.Fixpoint.SortCheck as So
 import qualified Language.Fixpoint.Types as F
+import qualified Language.Fixpoint.Types.Config as C
 import qualified Language.Fixpoint.Types.Visitor as V
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit
@@ -35,6 +37,7 @@ tests =
         , testCase "body-only free sort coordinates remain reserved" bodySortOwner
         , testCase "a global definition may share its nested term binder's spelling" nestedTermOwner
         , testCase "lifting preserves a sealed type abstraction (not solver support)" sealedTypeOwner
+        , testCase "an exported solution carries the lifted definitions it uses" liftedExport
         ]
 
 query :: F.IBindEnv -> F.Expr -> F.Expr -> F.FInfo ()
@@ -240,3 +243,55 @@ sealedTypeOwner = do
     case F.reftPred (F.sr_reft refinement) of
         F.PAnd [_, retained] -> retained @?= sealed
         _ -> assertFailure "lifting changed the sealed subtree's enclosing syntax"
+
+-- The producer lifts a lexical helper into a definition of its own SMT context.
+-- Its eliminated solution is then a premise of a separate consumer query, as a
+-- client's admitted callable type is: the export must keep the helper's meaning
+-- without naming the producer's definition.
+liftedExport :: Assertion
+liftedExport = do
+    result <- Solver.solve config producer
+    case F.resStatus result of
+        F.Safe _ -> pure ()
+        status -> assertFailure ("producer relation was rejected: " ++ show status)
+    exported <- case M.lookup (kvar 0) (F.resNonCutsSolution result) of
+        Just delayed -> pure (F.forceDelayed delayed)
+        Nothing -> assertFailure "expected an eliminated public solution"
+    let formal name = M.fromList [(F.formalSource f, F.formalCanonical f) | f <- F.resScopes result M.! kvar 0] M.! name
+        imported = F.subst (F.mkSubst [(formal "vv", var "y"), (formal "input", var "z")]) exported
+    forM_
+        [ (F.EEq (var "z") (int 1), True)
+        , (F.EEq (var "y") (F.EBin F.Plus (var "z") (var "fixed")), True)
+        , (F.EEq (var "z") (int 2), False)
+        ]
+        $ \(goal, expected) -> do
+            consumed <- Solver.solve config (consumer imported goal)
+            case (expected, F.resStatus consumed) of
+                (True, F.Safe _) -> pure ()
+                (False, F.Unsafe _ _) -> pure ()
+                (_, status) -> assertFailure ("consumer of the export changed meaning for " ++ show goal ++ ": " ++ show status)
+    assertBool
+        ("the export names a producer-local definition: " ++ show (F.syms exported))
+        (F.syms exported `S.isSubsetOf` S.fromList [formal "vv", formal "input", "fixed"])
+  where
+    config = cfg{C.eliminate = C.Some, C.cores = Just 1, C.noEnvReduction = True}
+    refinement predicate = F.RR F.FInt (F.Reft ("vv", predicate))
+    constraint index context lhs rhs = (index, F.mkSubC context (refinement lhs) (refinement rhs) (Just index) [] ())
+    helper = F.ELet "helper" (F.ELam ("argument", F.FInt) (F.EEq (var "argument") (int 1))) (F.EApp (var "helper") (var "source"))
+    relation = F.PAnd [F.EEq (var "vv") (F.EBin F.Plus (var "source") (var "fixed")), helper]
+    occurrence = F.PKVar (kvar 0) mempty (F.mkKVarSubst [("input", var "source")])
+    producer =
+        mempty
+            { F.bs = F.bindEnvFromList [binding 0 "source" F.FInt F.PTrue, binding 1 "input" F.FInt F.PTrue]
+            , F.gLits = F.fromListSEnv [("fixed", F.FInt)]
+            , F.hoInfo = F.cfgHoInfo config
+            , F.cm = M.fromList [constraint 1 (F.fromListIBindEnv [0]) relation occurrence, constraint 2 (F.fromListIBindEnv [0]) occurrence relation]
+            , F.ws = M.singleton (kvar 0) (F.WfC (F.fromListIBindEnv [1]) [("vv", F.FInt)] (kvar 0) ())
+            }
+    consumer imported goal =
+        mempty
+            { F.bs = F.bindEnvFromList [binding 0 "z" F.FInt F.PTrue, binding 1 "y" F.FInt imported]
+            , F.gLits = F.fromListSEnv [("fixed", F.FInt)]
+            , F.hoInfo = F.cfgHoInfo config
+            , F.cm = M.fromList [constraint 1 (F.fromListIBindEnv [0, 1]) F.PTrue goal]
+            }
