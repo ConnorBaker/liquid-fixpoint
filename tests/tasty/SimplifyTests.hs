@@ -3,7 +3,7 @@
 module SimplifyTests (tests) where
 
 import Arbitrary (subexprs)
-import Language.Fixpoint.Types.Refinements (Bop (Minus, Mod), Brel (Eq), Constant (I), Expr, ExprBV (..))
+import Language.Fixpoint.Types.Refinements (Bop (Div, Minus, Mod, RTimes), Brel (Eq), Constant (I, R), Expr, ExprBV (..))
 import Language.Fixpoint.Types.Sorts (Sort (FInt))
 import qualified SimplifyInterpreter
 import qualified SimplifyPLE
@@ -33,6 +33,8 @@ tests =
                 , testProperty "Interpreter" (prop_no_increase SimplifyInterpreter.simplify')
                 ]
         , moduloTests
+        , nestedDivisionTests
+        , realFoldingTests
         , testGroup
             "constant substitution respects lexical binding"
             [ testCase name $ assertBool "capture-avoiding substitution" (expected (reduce expression))
@@ -97,3 +99,45 @@ moduloTests =
   where
     integer = ECon . I
     modulo numerator divisor = EBin Mod (integer numerator) (integer divisor)
+
+-- SMT integer division is Euclidean: (x div a) div b equals x div (a * b) when
+-- a > 0, but not when a < 0 (x = 3, a = -2, b = -2: 1 versus 0). A zero
+-- divisor stays uninterpreted, so it is never merged into a product.
+nestedDivisionTests :: TestTree
+nestedDivisionTests =
+    testGroup
+        "Euclidean nested division"
+        [ testGroup engine $
+            [ testCase ("(x div " ++ show inner ++ ") div " ++ show outer) $
+                assertEqual "SMT quotient" expected (reduce (nested inner outer))
+            | (inner, outer, expected) <-
+                [ (2, 3, quotient 6)
+                , (2, -3, quotient (-6))
+                , (-2, -2, nested (-2) (-2))
+                , (-2, 3, nested (-2) 3)
+                , (2, 0, nested 2 0)
+                ]
+            ]
+        | (engine, reduce) <- [("PLE simplifier", SimplifyPLE.simplify'), ("interpreter simplifier", SimplifyInterpreter.simplify')]
+        ]
+  where
+    x = EVar "x"
+    integer = ECon . I
+    quotient divisor = EBin Div x (integer divisor)
+    nested inner outer = EBin Div (quotient inner) (integer outer)
+
+-- SMT reals are exact; Double arithmetic is not, and SMT has no NaN or
+-- infinity. Real constants are therefore left for the solver.
+realFoldingTests :: TestTree
+realFoldingTests =
+    testGroup
+        "real constants"
+        [ testGroup engine $
+            [ testCase (show left ++ " * " ++ show right) $
+                assertEqual "unfolded" (product' left right) (reduce (product' left right))
+            | (left, right) <- [(1.0e308, 10), (0.1, 3)]
+            ]
+        | (engine, reduce) <- [("PLE simplifier", SimplifyPLE.simplify'), ("interpreter simplifier", SimplifyInterpreter.simplify')]
+        ]
+  where
+    product' left right = EBin RTimes (ECon (R left)) (ECon (R right))
