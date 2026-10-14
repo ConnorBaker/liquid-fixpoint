@@ -1574,10 +1574,17 @@ resolveSort sort = (`apply` sort) <$> readTVSubst
 --------------------------------------------------------------------------------
 apply :: TVSubst -> Sort -> Sort
 --------------------------------------------------------------------------------
-apply (Th bindings) = sortSubstVars bindings
+-- The substitution is triangular: an image may name a coordinate solved
+-- later. Resolve images until no solved coordinate remains; unification's
+-- occurs check rules out cycles.
+apply (Th bindings) = resolve
+  where
+    resolve sort
+        | any (`M.member` bindings) (S.toList (freeSortIndices sort)) = resolve (sortSubstVars bindings sort)
+        | otherwise = sort
 
 applyExpr :: Env -> TVSubst -> Expr -> Expr
-applyExpr declarations (Th substitution) = Vis.resolveExprSorts (lookupNumericKind declarations) substitution
+applyExpr declarations theta@(Th substitution) = Vis.resolveExprSorts (lookupNumericKind declarations) (M.map (apply theta) substitution)
 
 --------------------------------------------------------------------------------
 
@@ -1615,7 +1622,7 @@ instance Monoid TVSubst where
   mappend = (<>)
 
 updateVar :: Int -> Sort -> TVSubst -> TVSubst
-updateVar !i !t (Th m) = Th (M.insert i t (M.map (sortSubstVars (M.singleton i t)) m))
+updateVar !i !t (Th m) = Th (M.insert i t m)
 
 emptySubst :: TVSubst
 emptySubst = Th M.empty
