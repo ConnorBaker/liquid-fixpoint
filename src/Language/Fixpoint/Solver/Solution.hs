@@ -721,7 +721,12 @@ nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (ex
     export variable =
         let occurrence = F.KVS (F.vv Nothing) F.boolSort variable (F.toKVarSubst M.empty) mempty
             (predicate, final) = St.runState (sharedKVar select cfg g solution occurrence) initial
-         in bindSummaries (summaryBodies final) (F.syms predicate) predicate
+         in bindSummaries (summaryBodies final <> definitions) (F.syms predicate) predicate
+    -- Query definitions, including lexical functions lifted by sanitization,
+    -- exist only in this solver's SMT context. Like eliminated summaries, an
+    -- export carries those it uses, so it keeps its meaning in another query.
+    F.MkDefinedFuns defined = F.defns info
+    definitions = M.fromList [(F.eqName equation, equation) | equation <- defined]
     -- A defining cube is a complete constraint environment. Its body and
     -- actual admission use that environment, not an ancestor's witnesses.
     -- Keep every equality and close every witness at EVERY nested definition
