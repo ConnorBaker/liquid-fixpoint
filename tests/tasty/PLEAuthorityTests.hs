@@ -15,6 +15,7 @@ import qualified Language.Fixpoint.Types.Config as C
 import qualified Language.Fixpoint.Utils.Files as Files
 import System.Exit (ExitCode (..))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertFailure, testCase, (@?=))
 
@@ -31,6 +32,10 @@ tests =
             check [1] sourceOnly guardedSibling
         , testCase "guarded assumption does not publish an unconditional equation" $
             check [1] sourceOnly guardedAssumption
+        , testCase "a call beneath an undecided guard does not unfold without end" $
+            terminates (check [1] Nothing (descentQuery False))
+        , testCase "an undecided guard still exposes its two branches" $
+            terminates (check [] Nothing (descentQuery True))
         , testCase "inferred qualifier is not a new source demand" $
             check [3] sourceOnly inferredDemand
         , testCase "raw total equations retain extensional unfolding" $
@@ -346,6 +351,32 @@ sourceOnly = Just S.empty
 -- Both source lambdas return the same nominal sort. Only the positive
 -- constructor field has that sort too. Match the normalizer's binder name so
 -- its alpha-renaming cannot hide a term/type-coordinate collision from PLE.
+-- Each unfolding decides the outer guards from the constructor it was given,
+-- then recurses beneath an undecided guard on another constructor of the same
+-- shape. Only the first undecided guard's branches are needed for the valid
+-- goal; unfolding beneath every later one never reaches a decided guard.
+descentQuery :: Bool -> F.FInfo ()
+descentQuery valid =
+    rr' "ple-undecided-descent" $
+        unlines
+            [ "data P 0 = [ | And {andL : P, andR : P} | Not {notP : P} | Var {} ]"
+            , "constant crunch : func(0, [P; P])"
+            , "define crunch (t : P) : P = {if (is$Var t) then t else (if (is$Not t) then (if (is$And (notP t)) then (crunch (Not (andL (notP t)))) else t) else (And (crunch (andL t)) (crunch (andR t))))}"
+            , "bind 0 p : {v : P | true}"
+            , "bind 1 x : {v : P | v = Not p}"
+            , "bind 2 y : {v : P | v = crunch x}"
+            , "constraint:"
+            , "  env [0; 1; 2]"
+            , "  lhs {v : P | v = y}"
+            , "  rhs {v : P | " ++ (if valid then "is$And p || v = x" else "is$Var v") ++ "}"
+            , "  id 1 tag []"
+            , "expand [1 : True]"
+            ]
+
+terminates :: Assertion -> Assertion
+terminates assertion =
+    timeout 30000000 assertion >>= maybe (assertFailure "PLE did not finish within 30 seconds") pure
+
 nominalScopeQuery :: Bool -> F.FInfo ()
 nominalScopeQuery valid =
     base
