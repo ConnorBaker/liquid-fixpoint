@@ -873,9 +873,13 @@ evalDemandIte γ ctx et (EIte condition yes no) = do
   case known of
     Just True  -> eval γ ctx et yes
     Just False -> eval γ ctx et no
-    Nothing -> EIte condition'
-      <$> evalDemandBranch condition' γ ctx et yes
-      <*> evalDemandBranch (PNot condition') γ ctx et no
+    -- A branch's own undecided guards stay unevaluated, as upstream leaves
+    -- every undecided guard: unfolding beneath them need not terminate.
+    Nothing
+      | knInDemandBranch γ -> pure (EIte condition' yes no)
+      | otherwise -> EIte condition'
+          <$> evalDemandBranch condition' γ ctx et yes
+          <*> evalDemandBranch (PNot condition') γ ctx et no
 evalDemandIte γ ctx et e = eval γ ctx et e
 
 evalDemandBranch :: Expr -> Knowledge -> ICtx -> EvalType -> Expr -> EvalST Expr
@@ -886,7 +890,7 @@ evalDemandBranch premise γ ctx et e = do
     , evPendingUnfoldings = mempty
     , evSMTCache = mempty
     }
-  let scoped = γ { knPreds = \bs xs goal -> knPreds γ bs xs (PImp premise goal) }
+  let scoped = γ { knPreds = \bs xs goal -> knPreds γ bs xs (PImp premise goal), knInDemandBranch = True }
   e' <- eval scoped ctx et e
   inner <- get
   -- Use a Boolean equation so both sides of the discovered equality remain
@@ -1478,6 +1482,7 @@ data Knowledge = KN
   , knDCs               :: !(S.HashSet Symbol)  -- ^ data constructors drawn from Rewrite
   , knAutoRWs           :: M.HashMap SubcId [AutoRewrite]
   , knRWTerminationOpts :: RWTerminationOpts
+  , knInDemandBranch    :: Bool -- ^ Evaluating beneath an undecided guard.
   }
 
 -- | A type to express whether SMeasures originate from data definitions.
@@ -1516,6 +1521,7 @@ knowledge cfg si = KN
       if rwTermination cfg
       then RWTerminationCheckEnabled
       else RWTerminationCheckDisabled
+  , knInDemandBranch           = False
   }
   where
     (simDCTests, sims0) =
