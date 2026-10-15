@@ -63,6 +63,8 @@ import qualified Language.Fixpoint.Types              as F
 import qualified Language.Fixpoint.Types.Solutions    as Sol
 import           Language.Fixpoint.Types.Constraints  hiding (ws, bs)
 import           Prelude                              hiding (init, lookup)
+import           Data.IORef                           (IORef, newIORef, readIORef, atomicModifyIORef')
+import           System.IO.Unsafe                     (unsafePerformIO)
 
 
 --------------------------------------------------------------------------------
@@ -362,6 +364,8 @@ data SummaryState = SummaryState
     -- ^ Each binding's sort indices, computed at most once per query.
     , summaryIndices :: S.HashSet Int
     -- ^ The sort indices of every recorded summary's declaration.
+    , summaryProjections :: Maybe ProjectionMemo
+    -- ^ Projections shared with the other observations of one query.
     }
 type SummaryM = St.State SummaryState
 
@@ -395,6 +399,7 @@ prepareSummaryState scope info = initial
             formals
             bindIndices
             mempty
+            Nothing
     bindIndices =
         LazyMap.fromList
             [(i, So.sortFieldIndices (F.sr_sort refinement)) | (i, (_, refinement, _)) <- F.bindEnvToList be]
@@ -596,7 +601,7 @@ sharedCube select cfg original solution occurrence cube = do
                         ( summaryIndices state0
                             : [LazyMap.lookupDefault mempty i (summaryBindIndices state0) | i <- F.elemsIBindEnv (ceIEnv environment)]
                         )
-                projected = simplifyKVarWithin covered declarations localSorts predicate
+                projected = sharedProjection (summaryProjections state0) definitions (variable, Sol.cuId cube, ceScopeKey environment) covered declarations localSorts parameters predicate
             name <- recordSummary original parameters projected
             let value = F.eApps (F.EVar name) (map (F.EVar . fst) parameters)
             St.modify (\state -> state{summaryCubes = Ordered.insert key value (summaryCubes state)})
@@ -767,7 +772,7 @@ nonCutsResult :: Config -> S.HashSet F.Symbol -> F.SInfo ann -> Sol.Sol Sol.QBin
 nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (export variable)) (Sol.sHyp solution)
   where
     g = combinedEnv info scope F.emptyIBindEnv F.dummySpan F.emptyIBindEnv mempty
-    initial = prepareSummaryState scope info
+    initial = (prepareSummaryState scope info){summaryProjections = Just (newProjectionMemo solution)}
     export variable =
         let occurrence = F.KVS (F.vv Nothing) F.boolSort variable (F.toKVarSubst M.empty) mempty
             (predicate, final) = St.runState (sharedKVar select cfg g solution occurrence) initial
@@ -882,6 +887,215 @@ symSorts g bs = [(name, F.sr_sort refinement) | (name, refinement) <- F.envCs (F
 
 _noKvars :: F.Expr -> Bool
 _noKvars = null . V.kvarsExpr
+
+{- | Projections of eliminated definitions, shared by one query's exports.
+
+Every export interprets its eliminated definitions in their own defining
+environments, so two exports that reach the same definition project the same
+predicate, except for the names each export's state gave the summaries that
+predicate calls. Summary names are fresh function symbols that projection only
+looks up and compares, so the projection of a predicate whose summary names are
+consistently renamed is the consistently renamed projection. A memo entry
+stores the projection with summary names replaced, in order of first
+occurrence, by reserved placeholders; a later export restores its own names.
+An entry is found by the definition it projects: the KVar, the defining
+cube and its scope. Exports interpret that definition in its own defining
+environment, never the caller's, so its predicate is the same in every
+export of the query up to summary names: the sorts, binders and actuals all
+come from the same environment. Matching an entry rechecks that predicate's
+shape, its symbols and the parameter and called-summary names, but not its
+sorts, whose comparison costs as much as the projection it would save.
+Fresh inference coordinates are excluded: both observations reserve every
+coordinate of the declarations they share, and projection retains declared,
+never inferred, sorts. An input that already mentions a placeholder name is
+projected directly.
+-}
+type ProjectionMemo = IORef (M.HashMap (F.KVar, Integer, [F.BindId]) [ProjectionEntry])
+
+data ProjectionEntry = ProjectionEntry
+    { entryLocals :: [(F.Symbol, F.Sort)]
+    , entryPredicate :: F.Expr
+    , entryCalled :: [(F.Symbol, F.Sort)]
+    , entryParameters :: [(F.Symbol, F.Sort)]
+    , entryResult :: F.Expr
+    }
+
+-- | A memo owned by one solution. Mentioning the owner keeps the allocation
+-- inside each call rather than letting it float to a shared constant.
+{-# NOINLINE newProjectionMemo #-}
+newProjectionMemo :: Sol.Solution -> ProjectionMemo
+newProjectionMemo owner = unsafePerformIO (newIORef (owner `seq` M.empty))
+
+sharedProjection ::
+    Maybe ProjectionMemo ->
+    M.HashMap F.Symbol F.Equation ->
+    (F.KVar, Integer, ([F.BindId], [(F.Symbol, F.Sort)])) ->
+    S.HashSet Int ->
+    F.SEnv F.Sort ->
+    F.SEnv F.Sort ->
+    [(F.Symbol, F.Sort)] ->
+    F.Expr ->
+    F.Expr
+sharedProjection Nothing _ _ covered declarations locals _ predicate =
+    simplifyKVarWithin covered declarations locals predicate
+sharedProjection (Just memo) summaries (variable, cube, (ids, scopeLocals)) covered declarations locals parameters predicate =
+    case canonicalSummaries summaries predicate of
+        Nothing -> direct
+        Just (forward, backward) ->
+            let canonical = renameFree forward predicate
+                called = List.sort [(placeholder, definedSort equation) | (name, placeholder) <- M.toList forward, Just equation <- [M.lookup name summaries]]
+                key = (variable, cube, ids)
+                matches entry =
+                    sameNames (entryLocals entry) scopeLocals
+                        && sameNames (entryParameters entry) parameters
+                        && sameNames (entryCalled entry) called
+                        && sameShape (entryPredicate entry) canonical
+             in unsafePerformIO $ do
+                    entries <- M.lookupDefault [] key <$> readIORef memo
+                    case List.find matches entries of
+                        Just entry -> pure (renameFree backward (entryResult entry))
+                        Nothing -> do
+                            let result = direct
+                                entry = ProjectionEntry scopeLocals canonical called parameters (renameFree forward result)
+                            atomicModifyIORef' memo (\table -> (M.insertWith (++) key [entry] table, ()))
+                            pure result
+  where
+    direct = simplifyKVarWithin covered declarations locals predicate
+    definedSort equation = foldr F.FFunc (F.eqSort equation) (map snd (F.eqArgs equation))
+
+sameNames :: [(F.Symbol, a)] -> [(F.Symbol, a)] -> Bool
+sameNames left right = map fst left == map fst right
+
+-- | Equality of expressions apart from their sorts.
+sameShape :: F.Expr -> F.Expr -> Bool
+sameShape left right = case (left, right) of
+    (F.ESym a, F.ESym b) -> a == b
+    (F.ECon (F.L a _), F.ECon (F.L b _)) -> a == b
+    (F.ECon a, F.ECon b) -> a == b
+    (F.EVar a, F.EVar b) -> a == b
+    (F.EApp f a, F.EApp g b) -> sameShape f g && sameShape a b
+    (F.ENeg a, F.ENeg b) -> sameShape a b
+    (F.EBin o a b, F.EBin p c d) -> o == p && sameShape a c && sameShape b d
+    (F.ELet x a b, F.ELet y c d) -> x == y && sameShape a c && sameShape b d
+    (F.EIte a b c, F.EIte d e f) -> sameShape a d && sameShape b e && sameShape c f
+    (F.ECst a _, F.ECst b _) -> sameShape a b
+    (F.ELam (x, _) a, F.ELam (y, _) b) -> x == y && sameShape a b
+    (F.ETApp a _, F.ETApp b _) -> sameShape a b
+    (F.ETAbs a x, F.ETAbs b y) -> x == y && sameShape a b
+    (F.PAnd as, F.PAnd bs) -> sameList as bs
+    (F.POr as, F.POr bs) -> sameList as bs
+    (F.PNot a, F.PNot b) -> sameShape a b
+    (F.PImp a b, F.PImp c d) -> sameShape a c && sameShape b d
+    (F.PIff a b, F.PIff c d) -> sameShape a c && sameShape b d
+    (F.PAtom r a b, F.PAtom q c d) -> r == q && sameShape a c && sameShape b d
+    (F.PKVar k _ su, F.PKVar l _ tu) ->
+        k == l
+            && M.keysSet (F.fromKVarSubst su) == M.keysSet (F.fromKVarSubst tu)
+            && and [maybe False (sameShape e) (M.lookup x (F.fromKVarSubst tu)) | (x, e) <- M.toList (F.fromKVarSubst su)]
+    (F.PAll xs a, F.PAll ys b) -> sameNames xs ys && sameShape a b
+    (F.PExist xs a, F.PExist ys b) -> sameNames xs ys && sameShape a b
+    (F.ECoerc _ _ a, F.ECoerc _ _ b) -> sameShape a b
+    _ -> False
+  where
+    sameList as bs = length as == length bs && and (zipWith sameShape as bs)
+
+-- | Summary names of a predicate, in order of first occurrence, paired with
+-- reserved placeholders; 'Nothing' when the predicate already uses one.
+canonicalSummaries :: M.HashMap F.Symbol F.Equation -> F.Expr -> Maybe (M.HashMap F.Symbol F.Symbol, M.HashMap F.Symbol F.Symbol)
+canonicalSummaries summaries predicate
+    | any reserved (S.toList (exprNames predicate)) = Nothing
+    | otherwise = Just (M.fromList pairs, M.fromList [(placeholder, name) | (name, placeholder) <- pairs])
+  where
+    pairs = zip (firstOccurrences [name | name <- exprVars predicate, M.member name summaries]) [F.symbol ("lq_summary_placeholder##" ++ show i) | i <- [0 :: Int ..]]
+    reserved name = Text.isPrefixOf (Text.pack "lq_summary_placeholder##") (F.symbolText name)
+    firstOccurrences = go S.empty
+      where
+        go _ [] = []
+        go seen (name : rest)
+            | S.member name seen = go seen rest
+            | otherwise = name : go (S.insert name seen) rest
+
+-- | Every variable occurrence, left to right.
+exprVars :: F.Expr -> [F.Symbol]
+exprVars expression = go expression []
+  where
+    go e rest = case e of
+        F.EVar name -> name : rest
+        F.EApp f a -> go f (go a rest)
+        F.ENeg a -> go a rest
+        F.EBin _ a b -> go a (go b rest)
+        F.ELet _ a b -> go a (go b rest)
+        F.EIte c a b -> go c (go a (go b rest))
+        F.ECst a _ -> go a rest
+        F.ELam _ a -> go a rest
+        F.ETApp a _ -> go a rest
+        F.ETAbs a _ -> go a rest
+        F.PAnd ps -> foldr go rest ps
+        F.POr ps -> foldr go rest ps
+        F.PNot a -> go a rest
+        F.PImp a b -> go a (go b rest)
+        F.PIff a b -> go a (go b rest)
+        F.PAtom _ a b -> go a (go b rest)
+        F.PKVar _ _ su -> foldr go rest (M.elems (F.fromKVarSubst su))
+        F.PAll _ a -> go a rest
+        F.PExist _ a -> go a rest
+        F.ECoerc _ _ a -> go a rest
+        _ -> rest
+
+-- | Every name, bound or free.
+exprNames :: F.Expr -> S.HashSet F.Symbol
+exprNames expression = S.fromList (exprVars expression ++ binders expression)
+  where
+    binders e = case e of
+        F.ELet x a b -> x : binders a ++ binders b
+        F.ELam (x, _) a -> x : binders a
+        F.ETAbs a x -> x : binders a
+        F.PAll bs a -> map fst bs ++ binders a
+        F.PExist bs a -> map fst bs ++ binders a
+        F.PKVar _ _ su -> M.keys (F.fromKVarSubst su) ++ concatMap binders (M.elems (F.fromKVarSubst su))
+        F.EApp f a -> binders f ++ binders a
+        F.ENeg a -> binders a
+        F.EBin _ a b -> binders a ++ binders b
+        F.EIte c a b -> binders c ++ binders a ++ binders b
+        F.ECst a _ -> binders a
+        F.ETApp a _ -> binders a
+        F.PAnd ps -> concatMap binders ps
+        F.POr ps -> concatMap binders ps
+        F.PNot a -> binders a
+        F.PImp a b -> binders a ++ binders b
+        F.PIff a b -> binders a ++ binders b
+        F.PAtom _ a b -> binders a ++ binders b
+        F.ECoerc _ _ a -> binders a
+        _ -> []
+
+-- | Rename free variable occurrences; the renamed names are never bound.
+renameFree :: M.HashMap F.Symbol F.Symbol -> F.Expr -> F.Expr
+renameFree names
+    | M.null names = id
+    | otherwise = go
+  where
+    go e = case e of
+        F.EVar name -> F.EVar (M.lookupDefault name name names)
+        F.EApp f a -> F.EApp (go f) (go a)
+        F.ENeg a -> F.ENeg (go a)
+        F.EBin o a b -> F.EBin o (go a) (go b)
+        F.ELet x a b -> F.ELet x (go a) (go b)
+        F.EIte c a b -> F.EIte (go c) (go a) (go b)
+        F.ECst a t -> F.ECst (go a) t
+        F.ELam b a -> F.ELam b (go a)
+        F.ETApp a t -> F.ETApp (go a) t
+        F.ETAbs a x -> F.ETAbs (go a) x
+        F.PAnd ps -> F.PAnd (map go ps)
+        F.POr ps -> F.POr (map go ps)
+        F.PNot a -> F.PNot (go a)
+        F.PImp a b -> F.PImp (go a) (go b)
+        F.PIff a b -> F.PIff (go a) (go b)
+        F.PAtom r a b -> F.PAtom r (go a) (go b)
+        F.PKVar k t su -> F.PKVar k t (F.toKVarSubst (M.map go (F.fromKVarSubst su)))
+        F.PAll bs a -> F.PAll bs (go a)
+        F.PExist bs a -> F.PExist bs (go a)
+        F.ECoerc s t a -> F.ECoerc s t (go a)
+        _ -> e
 
 {- | Project existential witnesses without changing source sorts or free names.
 The declarations own type coordinates; the separate telescope contains the
