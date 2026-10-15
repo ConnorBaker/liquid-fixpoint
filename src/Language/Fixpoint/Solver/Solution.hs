@@ -581,7 +581,9 @@ sharedCube select cfg original solution occurrence cube = do
             state0 <- St.get
             let definitions = summaryBodies state0
             let definedSort equation = foldr F.FFunc (F.eqSort equation) (map snd (F.eqArgs equation))
-                declarations = F.fromListSEnv [(F.eqName equation, definedSort equation) | equation <- M.elems definitions] <> declarationSEnv environment
+                -- Projection only looks up names of the predicate and of its
+                -- subterms, so only the summaries it calls need declaring.
+                declarations = F.fromListSEnv [(F.eqName equation, definedSort equation) | name <- S.toList free, Just equation <- [M.lookup name definitions]] <> declarationSEnv environment
                 localSorts = F.fromListSEnv parameters <> ceLocalSorts environment
                 -- Build the complete witness relation first. Projection then
                 -- substitutes only checked defining equalities, preserving
