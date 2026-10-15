@@ -978,10 +978,27 @@ sourceIdentity left right = left == right && all ((== 1) . S.size) evidence
     carriers =
         Generics.everythingBut (M.unionWith S.union) $
             Generics.mkQ (M.empty, False) constructor
+                `Generics.extQ` sort
                 `Generics.extQ` (atom :: F.Symbol -> (M.HashMap F.Symbol (S.HashSet Bool), Bool))
                 `Generics.extQ` (atom :: Text.Text -> (M.HashMap F.Symbol (S.HashSet Bool), Bool))
                 `Generics.extQ` (atom :: String -> (M.HashMap F.Symbol (S.HashSet Bool), Bool))
-    constructor tc = (M.singleton (F.val (F.fTyconSymbol tc)) (S.singleton (F.isString (F.FTC tc))), True)
+    constructor tc = (carrier tc, True)
+    carrier tc = M.singleton (F.val (F.fTyconSymbol tc)) (S.singleton (F.isString (F.FTC tc)))
+    -- The generic query visits a sort's constructors and nothing else; fold
+    -- them directly rather than casting at every node of a large sort.
+    sort s = (sortCarriers M.empty s, True)
+    sortCarriers acc s = case s of
+        F.FTC tc -> M.unionWith S.union (carrier tc) acc
+        F.FFunc t0 t1 -> sortCarriers (sortCarriers acc t0) t1
+        F.FApp t0 t1 -> sortCarriers (sortCarriers acc t0) t1
+        F.FAbs _ t -> sortCarriers acc t
+        F.FInt -> acc
+        F.FReal -> acc
+        F.FNum -> acc
+        F.FFrac -> acc
+        F.FObj _ -> acc
+        F.FVar _ -> acc
+        F.FNatNum _ -> acc
     atom _ = (M.empty, True)
 
 {- | Sound, deliberately partial alpha comparison for solution conjunctions.

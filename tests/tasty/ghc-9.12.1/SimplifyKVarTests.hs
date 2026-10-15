@@ -202,6 +202,12 @@ alphaTests =
       F.alphaEq S.empty (F.ECst (F.EVar "f") ordinaryConstructor) (F.ECst (F.EVar "f") stringConstructor) @?= False
   , testCase "constructor carrier metadata matters in binder sorts" $
       F.alphaEq S.empty (F.PExist [("x", ordinaryConstructor)] F.PTrue) (F.PExist [("x", stringConstructor)] F.PTrue) @?= False
+  , testCase "constructor carrier metadata matters inside applied sorts" $
+      F.alphaEq S.empty (F.ECst (F.EVar "f") (F.FApp listConstructor ordinaryConstructor)) (F.ECst (F.EVar "f") (F.FApp listConstructor stringConstructor)) @?= False
+  , testCase "constructor carrier metadata matters inside function sorts" $
+      F.alphaEq S.empty (F.ECst (F.EVar "f") (F.FFunc ordinaryConstructor F.FInt)) (F.ECst (F.EVar "f") (F.FFunc stringConstructor F.FInt)) @?= False
+  , testCase "one carrier per constructor admits nested sorts" $
+      F.alphaEq S.empty (F.ECst (F.EVar "f") (F.FFunc (F.FApp listConstructor stringConstructor) F.FInt)) (F.ECst (F.EVar "f") (F.FFunc (F.FApp listConstructor stringConstructor) F.FInt)) @?= True
   ]
  where
   alpha label expectedResult left right =
@@ -211,8 +217,9 @@ alphaTests =
 parse :: String -> F.Expr
 parse = doParse'' True predP "typed simplification regression"
 
-ordinaryConstructor, stringConstructor :: F.Sort
+ordinaryConstructor, stringConstructor, listConstructor :: F.Sort
 ordinaryConstructor = F.FTC (F.symbolFTycon (F.dummyLoc "CarrierWitness"))
+listConstructor = F.FTC (F.symbolFTycon (F.dummyLoc "CarrierList"))
 -- The public serialization instances can carry metadata not produced by the
 -- standard named constructors. Exercise that representation through Data.
 stringConstructor =
