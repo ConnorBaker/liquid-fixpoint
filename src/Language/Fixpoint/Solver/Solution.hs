@@ -387,7 +387,7 @@ prepareSummaryState scope info = initial
     initial =
         SummaryState
             (F.tempSymbol (F.symbol "eliminated_summary") 0)
-            (scope `S.union` formals)
+            (S.unions [scope, formals, fixedSymbols info])
             mempty
             mempty
             mempty
@@ -449,11 +449,11 @@ summaryFree environment expression =
 recordSummary :: CombinedEnv a -> [(F.Symbol, F.Sort)] -> F.Expr -> SummaryM F.Symbol
 recordSummary environment parameters body = do
     state <- St.get
+    -- summaryNames already holds the observation's scope and fixed names,
+    -- which every environment of the observation shares.
     let occupied =
             S.unions
                 [ summaryNames state
-                , ceInScope environment
-                , ceFixed environment
                 , S.fromList (map fst (F.toListSEnv (ceLocalSorts environment)) ++ map fst parameters)
                 , F.syms body
                 ]
@@ -502,7 +502,8 @@ interpretExpr interpret original expression
             { ceInScope = ceInScope environment `S.union` S.fromList (map fst bindings)
             }
     support = ceInScope environment `S.union` ceFixed environment
-    shadows bindings value = any (`S.member` support) (map fst bindings) && not (V.isConc value)
+    supports name = S.member name (ceInScope environment) || S.member name (ceFixed environment)
+    shadows bindings value = any supports (map fst bindings) && not (V.isConc value)
     refresh value = F.substr (support `S.union` F.syms value) mempty value
     -- Refresh consumer binders before inserting a definition's free names.
     -- Rapier substitution also transports explicit and implicit KVar actuals.
@@ -648,12 +649,15 @@ data CombinedEnv a = CEnv
 -- Keep these projections lazy when an observation does not need them.
 combinedEnv :: F.SInfo a -> S.HashSet F.Symbol -> F.IBindEnv -> F.SrcSpan -> F.IBindEnv -> F.SEnv F.Sort -> CombinedEnv a
 combinedEnv info scope ids location known locals =
-    CEnv info scope ids location known locals fixed declarations (List.sort (F.elemsIBindEnv ids), List.sort (F.toListSEnv locals))
+    CEnv info scope ids location known locals (fixedSymbols info) declarations (List.sort (F.elemsIBindEnv ids), List.sort (F.toListSEnv locals))
   where
     declarations = F.sr_sort <$> F.fromListSEnv (F.envCs (F.bs info) ids)
-    -- Explicit query declarations own their names even when BindEnv repeats
-    -- them. Ambient built-ins are not declarations of a query-local witness.
-    fixed = S.fromList (map fst (F.toListSEnv (F.gLits info <> F.dLits info)) ++ map fst (F.toListSEnv defined))
+
+-- | Explicit query declarations own their names even when BindEnv repeats
+-- them. Ambient built-ins are not declarations of a query-local witness.
+fixedSymbols :: F.SInfo a -> S.HashSet F.Symbol
+fixedSymbols info = S.fromList (map fst (F.toListSEnv (F.gLits info <> F.dLits info)) ++ map fst (F.toListSEnv defined))
+  where
     defined = Thy.theorySymbols (F.ddecls info) <> Thy.theorySymbols (F.defns info) <> Thy.theorySymbols (F.aenvEqs (F.ae info))
 
 bindLocalSorts :: [(F.Symbol, F.Sort)] -> CombinedEnv a -> CombinedEnv a
