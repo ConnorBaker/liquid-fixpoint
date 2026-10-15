@@ -240,6 +240,7 @@ test-suite tasty
                     SummaryScopeTests
                     ParserTests
                     PLEAuthorityTests
+                    ProjectionCostTests
                     PolyFamilyTests
                     RecoveredRegressionTests
                     PreparedElaborationTests

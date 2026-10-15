@@ -14,6 +14,7 @@ import qualified NestedKVarActualTests
 import qualified PLEAuthorityTests
 import qualified ParserTests
 import qualified PolyFamilyTests
+import qualified ProjectionCostTests
 import qualified QueryAuthorityTests
 import qualified RecoveredRegressionTests
 import qualified RootSortCheckTests
@@ -37,6 +38,7 @@ main =
             , ShareMapTests.tests
             , SimplifyTests.tests
             , SimplifyKVarTests.tests
+            , ProjectionCostTests.tests
             , SolutionPresentationTests.tests
             , InterpretTests.tests
             , ValidityFilterTests.tests
