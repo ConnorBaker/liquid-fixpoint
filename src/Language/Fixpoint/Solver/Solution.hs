@@ -73,7 +73,9 @@ init cfg si ks =
     runReader initialize (solverFlags cfg)
   where
     initialize = do
-        context <- So.prepareSortCheck (Just native) mempty
+        -- The global qualifier environment is shared by every kvar: prepare
+        -- its declarations and occupied sort indices once.
+        context <- So.prepareSortCheck (Just native) genv
         traverse (refine context si qcs genv) ws
     native = symbolEnv cfg si
     qcs = mkQCluster (F.quals si)
@@ -109,7 +111,7 @@ qualSig q = [ p { F.qpSym = F.dummyName }  | p <- F.qParams q ]
 --------------------------------------------------------------------------------
 
 refine :: So.SortCheckContext -> F.SInfo a -> QCluster -> F.SEnv F.Sort -> F.WfC a -> ElabM Sol.QBind
-refine context info qs genv w = refineK (env `seq` So.extendSortCheck env context) (allowHOquals info) env lits qs (F.wvvs w)
+refine context info qs genv w = refineK (So.extendSortCheck wenvSort context) (allowHOquals info) env lits qs (F.wvvs w)
   where
     env = wenvSort <> genv
     wenvSort = F.sr_sort <$> F.fromListSEnv (F.envCs (F.bs info) (F.wenv w))
@@ -124,30 +126,34 @@ refineK :: So.SortCheckContext -> Bool -> F.SEnv F.Sort -> [F.Constant] -> QClus
 refineK context ho env lits qs vvs =
     Sol.qbFilterM (pure . okInst (So.checkSortAt context) vvs) eqs
   where
-    eqs = instK ho env lits vvs qs
+    eqs = instK ho env (So.sortCheckIndices context) lits vvs qs
 
 --------------------------------------------------------------------------------
--- | @instK ho env lits vvs qc@ instantiates the qualifiers in @qc@ for a kvar
---   with value variables @vvs@. The first (non-literal) parameter of each
+-- | @instK ho env occupied lits vvs qc@ instantiates the qualifiers in @qc@
+--   for a kvar with value variables @vvs@. @occupied@ holds the sort indices
+--   of @env@'s declarations, which fresh sort variables must avoid. The first (non-literal) parameter of each
 --   qualifier is instantiated with a value variable, and the rest with any
 --   other symbol in @env@, which includes the value variables. A kvar without
 --   value variables only gets @false@ as a candidate.
 instK :: Bool
       -> F.SEnv F.Sort
+      -> S.HashSet Int
       -> [F.Constant]
       -> [(F.Symbol, F.Sort)]
       -> QCluster
       -> Sol.QBind
 --------------------------------------------------------------------------------
-instK _  _   _    []  _  = Sol.qb [Sol.falseEqual]
-instK ho env lits vvs qc = Sol.qb . unique $
+instK _  _   _ _    []  _  = Sol.qb [Sol.falseEqual]
+instK ho env occupied lits vvs qc = Sol.qb . unique $
   [ Sol.eQual q xs ls
       | (sig, qs) <- M.toList qc
       , let (varSig, litSig) =  splitSig sig
-      , xs        <- instKSig ho env vvs varSig
+      , xs        <- instKSig shared varSig
       , ls        <- instLitSig lits litSig
       , q         <- qs
   ]
+  where
+    shared = instKEnv ho env occupied vvs
 
 -- split the QCSig into the parts that are for regular variables vs for wildcard-literals that are defined as `a#`, `b#` etc.
 -- e.g. see tests/horn/pos/wild_lits*.smt2
@@ -166,17 +172,37 @@ matchSort _       _          = False
 unique :: [Sol.EQual] -> [Sol.EQual]
 unique qs = M.elems $ M.fromList [ (Sol.eqPred q, q) | q <- qs ]
 
--- | @instKSig ho env vvs sig@ instantiates the first parameter of @sig@ with a
---   value variable in @vvs@, and the remaining parameters with symbols in @env@
---   and value variables other than the one chosen for the first parameter. The
---   name pattern of the first parameter is ignored.
-instKSig :: Bool
-         -> F.SEnv F.Sort
-         -> [(F.Symbol, F.Sort)]
+-- | The parts of qualifier instantiation that depend only on a kvar's
+--   environment and value variables, computed once per kvar rather than once
+--   per qualifier signature: each traverses the whole environment.
+data KEnv = KEnv
+  { keVvTyss    :: [(SortIdx, F.Sort, [F.Symbol])]
+  , keTyss      :: [(SortIdx, F.Sort, [F.Symbol])]
+  , keSymToSrch :: So.Env
+  , keOccupied  :: S.HashSet Int
+  }
+
+instKEnv :: Bool -> F.SEnv F.Sort -> S.HashSet Int -> [(F.Symbol, F.Sort)] -> KEnv
+instKEnv ho env occupied vvs = KEnv
+  { -- value variables use negative indices to keep them apart from the env
+    keVvTyss    = zipWith (\i (t, ys) -> (i, t, ys)) [-1, -2 ..] (Misc.groupList [ (t, x) | (x, t) <- vvs ])
+  , keTyss      = zipWith (\i (t, ys) -> (i, t, ys)) [1..] (instCands ho env')
+  , keSymToSrch = (`F.lookupSEnvWithDistance` env)
+  , keOccupied  = S.unions (occupied : map (F.sortIndices . snd) vvs)
+  }
+  where
+    -- Values extend term candidates, not the declarations owning sort aliases.
+    env' = List.foldl' (\e (v, t) -> F.insertSEnv v t e) env vvs
+
+-- | @instKSig shared sig@ instantiates the first parameter of @sig@ with a
+--   value variable, and the remaining parameters with symbols in the kvar's
+--   environment and value variables other than the one chosen for the first
+--   parameter. The name pattern of the first parameter is ignored.
+instKSig :: KEnv
          -> QCSig
          -> [[F.Symbol]]
-instKSig _  _   _   [] = error "Empty qsig in Solution.instKSig"
-instKSig ho env vvs (qp:qps) = do
+instKSig _ [] = error "Empty qsig in Solution.instKSig"
+instKSig (KEnv vvTyss tyss symToSrch occupied) (qp:qps) = do
   ixs    <- matchP occupied symToSrch (vvQP : restQPs)
   x : ys <- instSymbol (vvTyss ++ tyss) (reverse ixs)
   guard (x `notElem` ys)
@@ -184,13 +210,6 @@ instKSig ho env vvs (qp:qps) = do
   where
     vvQP       = (vvTyss, qp { F.qpPat = F.PatNone })
     restQPs    = [ (tyss, qp') | qp' <- qps ]
-    -- value variables use negative indices to keep them apart from the env
-    vvTyss     = zipWith (\i (t, ys) -> (i, t, ys)) [-1, -2 ..] (Misc.groupList [ (t, x) | (x, t) <- vvs ])
-    tyss       = zipWith (\i (t, ys) -> (i, t, ys)) [1..] (instCands ho env')
-    -- Values extend term candidates, not the declarations owning sort aliases.
-    env'       = List.foldl' (\e (v, t) -> F.insertSEnv v t e) env vvs
-    symToSrch  = (`F.lookupSEnvWithDistance` env)
-    occupied   = S.unions (map (F.sortIndices . snd) (vvs ++ F.toListSEnv env))
 
 instSymbol :: [(SortIdx, a, [F.Symbol])] -> [(SortIdx, QualPattern)] -> [[F.Symbol]]
 instSymbol tyss = go

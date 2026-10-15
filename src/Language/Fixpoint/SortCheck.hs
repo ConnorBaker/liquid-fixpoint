@@ -25,6 +25,7 @@ module Language.Fixpoint.SortCheck  (
   , prepareSortCheck
   , SortCheckContext
   , extendSortCheck
+  , sortCheckIndices
   , checkSortAt
   , checkSortedReftFull
   , checkSortFull
@@ -738,6 +739,10 @@ prepareSortCheck ~native base = do
 extendSortCheck :: SEnv Sort -> SortCheckContext -> SortCheckContext
 extendSortCheck ~bindings ~(SortCheckContext native base occupied ef) =
     SortCheckContext native (bindings <> base) (occupied `S.union` sortFieldIndices bindings) ef
+
+-- | The sort indices a context's declarations occupy.
+sortCheckIndices :: SortCheckContext -> S.HashSet Int
+sortCheckIndices (SortCheckContext _ _ occupied _) = occupied
 
 checkSortAt :: (Checkable a) => SortCheckContext -> SrcSpan -> Maybe Sort -> a -> Maybe Doc
 checkSortAt ~(SortCheckContext native environment occupied ef) sp expected t =
