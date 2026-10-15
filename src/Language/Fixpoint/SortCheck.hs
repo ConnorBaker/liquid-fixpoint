@@ -359,9 +359,12 @@ instantiateEquationEAt flags environment bindings location expected equation ori
         (domain :) <$> ownerTelescope (remaining - 1) result
     ownerTelescope _ _ = throwErrorAt "equation instantiation lost its saturated owner telescope"
 
+-- The native declarations are prepared once per elaborator; each telescope
+-- of local bindings only extends that context.
 expressionJudgmentEAt :: (SymEnv -> Env -> Maybe Sort -> Expr -> CheckM (Expr, Sort)) -> Cfg.ElabFlags -> Maybe SymEnv -> SEnv Sort -> Located String -> Maybe Sort -> Expr -> Either Error Expr
-expressionJudgmentEAt infer ~ef ~native ~bindings =
-    expressionJudgmentWithContext infer (runReader (prepareSortCheck native bindings) ef)
+expressionJudgmentEAt infer ~ef ~native =
+    let ~root = runReader (prepareSortCheck native mempty) ef
+     in \bindings -> expressionJudgmentWithContext infer (extendSortCheck bindings root)
 
 expressionJudgmentWithContext :: (SymEnv -> Env -> Maybe Sort -> Expr -> CheckM (Expr, Sort)) -> SortCheckContext -> Located String -> Maybe Sort -> Expr -> Either Error Expr
 expressionJudgmentWithContext infer ~(SortCheckContext native bindings environmentIndices ef) = runAt
