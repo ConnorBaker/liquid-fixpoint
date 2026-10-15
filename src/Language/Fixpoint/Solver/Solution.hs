@@ -266,6 +266,8 @@ applyQPP su qp = qp
 --   }
 
 --------------------------------------------------------------------------------
+-- | @occupied@ must include the indices of every candidate sort in @tyss@ and
+--   of the parameter's sort.
 candidatesP ::
   S.HashSet Int ->
   So.Env ->
@@ -276,7 +278,7 @@ candidatesP ::
 candidatesP occupied env tyss x =
   [ (su, idx, qPat)
   | (idx, t, _) <- tyss
-  , su <- maybeToList (So.unifyFastWith occupied mono env xt t)
+  , su <- maybeToList (So.unifyFastCovered occupied mono env xt t)
   ]
  where
   xt = F.qpSort x

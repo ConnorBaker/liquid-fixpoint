@@ -41,6 +41,7 @@ module Language.Fixpoint.SortCheck  (
   -- * Unify
   , unifyFast
   , unifyFastWith
+  , unifyFastCovered
   , unifySorts
   , unifyTo1
   , sortFieldIndices
@@ -1359,8 +1360,13 @@ checkURel expression left right =
 
 --------------------------------------------------------------------------------
 unifyWith :: S.HashSet Int -> Env -> Maybe Expr -> Sort -> Sort -> Maybe TVSubst
-unifyWith ~occupied f e t1 t2 =
-    case runCM0 f dummySpan Nothing (occupied `S.union` sortFieldIndices (e, t1, t2)) ((unify1 f e t1 t2 >> readTVSubst) <* validateSourceNativeEqualities) of
+unifyWith ~occupied f e t1 t2 = unifyCovered (occupied `S.union` sortFieldIndices (e, t1, t2)) f e t1 t2
+
+-- | Unification whose reserved coordinates already include every index of the
+-- expression and both operands.
+unifyCovered :: S.HashSet Int -> Env -> Maybe Expr -> Sort -> Sort -> Maybe TVSubst
+unifyCovered ~occupied f e t1 t2 =
+    case runCM0 f dummySpan Nothing occupied ((unify1 f e t1 t2 >> readTVSubst) <* validateSourceNativeEqualities) of
         Left _ -> Nothing
         Right su -> Just su
 
@@ -1406,6 +1412,13 @@ unifyFastWith ~occupied False f t1 t2 = unifyWith occupied f Nothing t1 t2
 unifyFastWith ~_ True _ t1 t2
     | t1 == t2 = Just emptySubst
     | otherwise = Nothing
+
+{- | 'unifyFastWith' for a caller whose reserved coordinates already include
+both operands' indices, so the operands need not be traversed again.
+-}
+unifyFastCovered :: S.HashSet Int -> Bool -> Env -> Sort -> Sort -> Maybe TVSubst
+unifyFastCovered ~occupied False f t1 t2 = unifyCovered occupied f Nothing t1 t2
+unifyFastCovered ~occupied True f t1 t2 = unifyFastWith occupied True f t1 t2
 
 {-
 eqFast :: Sort -> Sort -> Bool
