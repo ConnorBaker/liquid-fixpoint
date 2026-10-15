@@ -34,6 +34,7 @@ module Language.Fixpoint.SortCheck  (
   -- * Sort inference
   , sortExpr
   , sortExprE
+  , sortExprEWithin
   , checkSortExpr
   , exprSort
   , exprSortMaybe
@@ -532,9 +533,15 @@ sortExpr ~native ~location ~environment =
 -- Declaration preparation is shared; equations and expression coordinates are not.
 -- Lexical annotation sorts are interpreted in declarations before term insertion.
 sortExprE :: Maybe SymEnv -> SrcSpan -> SEnv Sort -> SEnv Sort -> Expr -> Either Error Sort
-sortExprE ~native ~location ~environment ~bindings = runAt
+sortExprE ~native ~location ~environment =
+    sortExprEWithin (nativeContextIndices native `S.union` sortFieldIndices environment) native location environment
+
+-- | 'sortExprE' for a caller whose reserved coordinates already include the
+-- native context's and the environment's indices.
+sortExprEWithin :: S.HashSet Int -> Maybe SymEnv -> SrcSpan -> SEnv Sort -> SEnv Sort -> Expr -> Either Error Sort
+sortExprEWithin ~covered ~native ~location ~environment ~bindings = runAt
   where
-    ~environmentIndices = nativeContextIndices native `S.union` sortFieldIndices (environment, bindings)
+    ~environmentIndices = covered `S.union` sortFieldIndices bindings
     ~declarations = (`lookupSEnvWithDistance` environment)
     ~locals = resolveNumericSort (lookupNumericKind declarations) <$> bindings
     ~terms = locals <> environment

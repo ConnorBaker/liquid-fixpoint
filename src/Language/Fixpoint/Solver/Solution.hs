@@ -44,6 +44,7 @@ import qualified Control.Monad.State.Strict as St
 import qualified Data.Map.Strict as Ordered
 import qualified Data.HashSet                   as S
 import qualified Data.HashMap.Strict            as M
+import qualified Data.HashMap.Lazy              as LazyMap
 import qualified Data.List                      as List
 import           Data.Maybe                     (maybeToList, isJust, isNothing)
 import qualified Data.Text as Text
@@ -357,6 +358,10 @@ data SummaryState = SummaryState
     , summaryTypes :: Ordered.Map (F.Symbol, [(F.Symbol, F.Sort)]) F.Symbol
     , summaryParameterSorts :: F.SEnv F.Sort
     , summaryFormals :: S.HashSet F.Symbol
+    , summaryBindIndices :: LazyMap.HashMap F.BindId (S.HashSet Int)
+    -- ^ Each binding's sort indices, computed at most once per query.
+    , summaryIndices :: S.HashSet Int
+    -- ^ The sort indices of every recorded summary's declaration.
     }
 type SummaryM = St.State SummaryState
 
@@ -388,6 +393,11 @@ prepareSummaryState scope info = initial
             mempty
             parameterSorts
             formals
+            bindIndices
+            mempty
+    bindIndices =
+        LazyMap.fromList
+            [(i, So.sortFieldIndices (F.sr_sort refinement)) | (i, (_, refinement, _)) <- F.bindEnvToList be]
     formals = S.fromList (concatMap (F.kvarDomain info) (M.keys (F.ws info)))
     be = F.bs info
     parameterSorts =
@@ -451,7 +461,12 @@ recordSummary environment parameters body = do
         equation = F.mkEquation name parameters body F.boolSort
     -- Reserve free support; nested lexical owners are protected by scoped
     -- interpretation and capture-avoiding specialization, not global freshness.
-    St.put state{summaryNext = name, summaryNames = names, summaryBodies = M.insert name equation (summaryBodies state)}
+    St.put state
+        { summaryNext = name
+        , summaryNames = names
+        , summaryBodies = M.insert name equation (summaryBodies state)
+        , summaryIndices = summaryIndices state `S.union` So.sortFieldIndices (map snd parameters)
+        }
     pure name
 
 dropSummaryUnsorted :: Config -> CombinedEnv a -> F.Subst -> SummaryM F.Subst
@@ -563,14 +578,22 @@ sharedCube select cfg original solution occurrence cube = do
                 missing = [name | name <- S.toList free, S.member name formals, isNothing (lookupSort name)]
             when (not (null missing)) $
                 Misc.errorstar ("lhsPredShared requires normalized typed formals: " ++ show missing)
-            definitions <- St.gets summaryBodies
+            state0 <- St.get
+            let definitions = summaryBodies state0
             let definedSort equation = foldr F.FFunc (F.eqSort equation) (map snd (F.eqArgs equation))
                 declarations = F.fromListSEnv [(F.eqName equation, definedSort equation) | equation <- M.elems definitions] <> declarationSEnv environment
                 localSorts = F.fromListSEnv parameters <> ceLocalSorts environment
                 -- Build the complete witness relation first. Projection then
                 -- substitutes only checked defining equalities, preserving
                 -- every witness constraint without duplicating equal calls.
-                projected = simplifyKVar declarations localSorts predicate
+                -- Summary declarations are Bool-valued functions of their
+                -- parameters, so their indices are their parameters' indices.
+                covered =
+                    S.unions
+                        ( summaryIndices state0
+                            : [LazyMap.lookupDefault mempty i (summaryBindIndices state0) | i <- F.elemsIBindEnv (ceIEnv environment)]
+                        )
+                projected = simplifyKVarWithin covered declarations localSorts predicate
             name <- recordSummary original parameters projected
             let value = F.eApps (F.EVar name) (map (F.EVar . fst) parameters)
             St.modify (\state -> state{summaryCubes = Ordered.insert key value (summaryCubes state)})
@@ -860,8 +883,14 @@ canonical KVar parameters. Logical sorts are inhabited, so unused witnesses
 may be dropped and independent conjuncts may leave their quantifier.
 -}
 simplifyKVar :: F.SEnv F.Sort -> F.SEnv F.Sort -> F.Expr -> F.Expr
-simplifyKVar declarations locals = conjoin . floatConjuncts locals . go locals
+simplifyKVar declarations = simplifyKVarWithin (So.sortFieldIndices declarations) declarations
+
+-- | 'simplifyKVar' for a caller that already holds the declarations' sort
+--   indices; witness inference prepares them once rather than per projection.
+simplifyKVarWithin :: S.HashSet Int -> F.SEnv F.Sort -> F.SEnv F.Sort -> F.Expr -> F.Expr
+simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals . go locals
   where
+    inferIn = So.sortExprEWithin covered Nothing F.dummySpan declarations
     go env (F.POr es) = disj $ map (conjoin . floatConjuncts env . go env) es
     go env (F.PAnd es) = conjoin $ concatMap (floatConjuncts env . go env) es
     go env (F.PExist bs e) = project env bs (go (bind bs env) e)
@@ -883,7 +912,7 @@ simplifyKVar declarations locals = conjoin . floatConjuncts locals . go locals
       where
         clauses = conjuncts (bind bs env) e
         residual = F.conj clauses
-        infer = So.sortExprE Nothing F.dummySpan declarations (bind bs env)
+        infer = inferIn (bind bs env)
         witness (F.PAtom F.Eq left right) = orient left right `mplus` orient right left
         witness _ = Nothing
         orient variable replacement = do
