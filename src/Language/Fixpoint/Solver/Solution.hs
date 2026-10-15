@@ -910,15 +910,33 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
 
     project env bs (F.PExist inner e) =
         project env (filter ((`notElem` map fst inner) . fst) bs ++ inner) e
-    project env bs e =
-        case break (isJust . fst) [(witness clause, clause) | clause <- clauses] of
-            (before, (Just binding, _) : after) ->
-                project env bs (F.subst1 (F.conj (map snd before ++ map snd after)) binding)
-            _ -> F.pExist (filter ((`S.member` F.syms residual) . fst) bs) residual
+    project env bs e = eliminate [(witness clause, clause) | clause <- conjuncts scope e]
       where
-        clauses = conjuncts (bind bs env) e
-        residual = F.conj clauses
-        infer = inferIn (bind bs env)
+        scope = bind bs env
+        -- Each step substitutes one witness into the conjunction of the other
+        -- clauses, exactly as re-projecting that conjunction would. Triviality
+        -- and witness judgments depend only on a clause, the fixed telescope
+        -- and the fixed environment, so a clause the substitution leaves
+        -- unchanged keeps both: it was retained, so it is not trivial.
+        -- Capture-avoiding substitution maps a conjunction's children in
+        -- order, so the substituted children align with the other clauses.
+        eliminate annotated =
+            case break (isJust . fst) annotated of
+                (before, (Just binding, _) : after) ->
+                    let others = before ++ after
+                        substituted = F.subst1 (F.conj (map snd others)) binding
+                     in case substituted of
+                            F.PAnd children
+                                | length others >= 2 ->
+                                    eliminate (concat (zipWith reuse others children))
+                            _ -> project env bs substituted
+                _ -> F.pExist (filter ((`S.member` F.syms residual) . fst) bs) residual
+          where
+            residual = F.conj (map snd annotated)
+        reuse (judgment, clause) clause'
+            | clause' == clause = [(judgment, clause')]
+            | otherwise = [(witness c, c) | c <- conjuncts scope clause']
+        infer = inferIn scope
         witness (F.PAtom F.Eq left right) = orient left right `mplus` orient right left
         witness _ = Nothing
         orient variable replacement = do
