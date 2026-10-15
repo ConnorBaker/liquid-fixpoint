@@ -910,7 +910,7 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
 
     project env bs (F.PExist inner e) =
         project env (filter ((`notElem` map fst inner) . fst) bs ++ inner) e
-    project env bs e = eliminate [(witness clause, clause) | clause <- conjuncts scope e]
+    project env bs e = eliminate (concatMap (annotate . pure) (conjuncts scope e))
       where
         scope = bind bs env
         -- Each step substitutes one witness into the conjunction of the other
@@ -919,23 +919,29 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
         -- and the fixed environment, so a clause the substitution leaves
         -- unchanged keeps both: it was retained, so it is not trivial.
         -- Capture-avoiding substitution maps a conjunction's children in
-        -- order, so the substituted children align with the other clauses.
+        -- order and with one scope set. On a child without binders or KVar
+        -- applications it only replaces free occurrences, so such a child
+        -- that does not mention the eliminated name is returned unchanged,
+        -- and one that does is substituted the same way under its own scope.
+        -- Only a child with binders needs the conjunction's complete scope.
         eliminate annotated =
-            case break (isJust . fst) annotated of
-                (before, (Just binding, _) : after) ->
-                    let others = before ++ after
-                        substituted = F.subst1 (F.conj (map snd others)) binding
-                     in case substituted of
-                            F.PAnd children
-                                | length others >= 2 ->
-                                    eliminate (concat (zipWith reuse others children))
-                            _ -> project env bs substituted
+            case break (isJust . cJudgment) annotated of
+                (before, Clause{cJudgment = Just binding} : after)
+                    | others@(_ : _ : _) <- before ++ after ->
+                        let (name, replacement) = binding
+                            replacementFree = F.syms replacement
+                            substitution = F.mkSubst [binding]
+                            whole = replacementFree `S.union` S.unions (map cFree others)
+                            step c
+                                | cSimple c && not (S.member name (cFree c)) = [c]
+                                | cSimple c = annotate (conjuncts scope (F.substr (replacementFree `S.union` cFree c) substitution (cExpr c)))
+                                | otherwise = annotate (conjuncts scope (F.substr whole substitution (cExpr c)))
+                         in eliminate (concatMap step others)
+                    | otherwise -> project env bs (F.subst1 (F.conj (map cExpr (before ++ after))) binding)
                 _ -> F.pExist (filter ((`S.member` F.syms residual) . fst) bs) residual
           where
-            residual = F.conj (map snd annotated)
-        reuse (judgment, clause) clause'
-            | clause' == clause = [(judgment, clause')]
-            | otherwise = [(witness c, c) | c <- conjuncts scope clause']
+            residual = F.conj (map cExpr annotated)
+        annotate clauses = [Clause (witness c) c (F.syms c) (simpleExpr c) | c <- clauses]
         infer = inferIn scope
         witness (F.PAtom F.Eq left right) = orient left right `mplus` orient right left
         witness _ = Nothing
@@ -1018,6 +1024,38 @@ sourceIdentity left right = left == right && all ((== 1) . S.size) evidence
         F.FVar _ -> acc
         F.FNatNum _ -> acc
     atom _ = (M.empty, True)
+
+-- | A retained projection clause with its fixed-scope judgments.
+data Clause = Clause
+    { cJudgment :: Maybe (F.Symbol, F.Expr)
+    , cExpr :: F.Expr
+    , cFree :: S.HashSet F.Symbol
+    , cSimple :: Bool
+    -- ^ No binders and no KVar applications.
+    }
+
+simpleExpr :: F.Expr -> Bool
+simpleExpr expression = case expression of
+    F.ELam{} -> False
+    F.ELet{} -> False
+    F.PKVar{} -> False
+    F.PAll{} -> False
+    F.PExist{} -> False
+    F.EApp function argument -> simpleExpr function && simpleExpr argument
+    F.ETApp value _ -> simpleExpr value
+    F.ETAbs value _ -> simpleExpr value
+    F.ECoerc _ _ value -> simpleExpr value
+    F.ENeg value -> simpleExpr value
+    F.EBin _ left right -> simpleExpr left && simpleExpr right
+    F.EIte condition left right -> simpleExpr condition && simpleExpr left && simpleExpr right
+    F.ECst value _ -> simpleExpr value
+    F.PAnd predicates -> all simpleExpr predicates
+    F.POr predicates -> all simpleExpr predicates
+    F.PNot predicate -> simpleExpr predicate
+    F.PImp left right -> simpleExpr left && simpleExpr right
+    F.PIff left right -> simpleExpr left && simpleExpr right
+    F.PAtom _ left right -> simpleExpr left && simpleExpr right
+    _ -> True
 
 {- | Sound, deliberately partial alpha comparison for solution conjunctions.
 Both existential telescopes use the same fresh names, preserving free names,
