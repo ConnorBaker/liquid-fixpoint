@@ -179,8 +179,8 @@ unique qs = M.elems $ M.fromList [ (Sol.eqPred q, q) | q <- qs ]
 --   environment and value variables, computed once per kvar rather than once
 --   per qualifier signature: each traverses the whole environment.
 data KEnv = KEnv
-  { keVvTyss    :: [(SortIdx, F.Sort, [F.Symbol])]
-  , keTyss      :: [(SortIdx, F.Sort, [F.Symbol])]
+  { keVvTyss    :: Candidates [F.Symbol]
+  , keTyss      :: Candidates [F.Symbol]
   , keSymToSrch :: So.Env
   , keOccupied  :: S.HashSet Int
   }
@@ -188,8 +188,8 @@ data KEnv = KEnv
 instKEnv :: Bool -> F.SEnv F.Sort -> S.HashSet Int -> [(F.Symbol, F.Sort)] -> KEnv
 instKEnv ho env occupied vvs = KEnv
   { -- value variables use negative indices to keep them apart from the env
-    keVvTyss    = zipWith (\i (t, ys) -> (i, t, ys)) [-1, -2 ..] (Misc.groupList [ (t, x) | (x, t) <- vvs ])
-  , keTyss      = zipWith (\i (t, ys) -> (i, t, ys)) [1..] (instCands ho env')
+    keVvTyss    = candidates (zipWith (\i (t, ys) -> (i, t, ys)) [-1, -2 ..] (Misc.groupList [ (t, x) | (x, t) <- vvs ]))
+  , keTyss      = candidates (zipWith (\i (t, ys) -> (i, t, ys)) [1..] (instCands ho env'))
   , keSymToSrch = (`F.lookupSEnvWithDistance` env)
   , keOccupied  = S.unions (occupied : map (F.sortIndices . snd) vvs)
   }
@@ -207,7 +207,7 @@ instKSig :: KEnv
 instKSig _ [] = error "Empty qsig in Solution.instKSig"
 instKSig (KEnv vvTyss tyss symToSrch occupied) (qp:qps) = do
   ixs    <- matchP occupied symToSrch (vvQP : restQPs)
-  x : ys <- instSymbol (vvTyss ++ tyss) (reverse ixs)
+  x : ys <- instSymbol (candidateList vvTyss ++ candidateList tyss) (reverse ixs)
   guard (x `notElem` ys)
   return (x : ys)
   where
@@ -239,7 +239,7 @@ type SortIdx = Int
 -- | @matchP env qps@ picks, for each parameter in @qps@, a sort index among the
 --   candidates paired with the parameter. Sort variables solved for one parameter
 --   are applied to the remaining ones. The result is in reverse order.
-matchP :: S.HashSet Int -> So.Env -> [([(SortIdx, F.Sort, a)], F.QualParam)] -> [[(SortIdx, QualPattern)]]
+matchP :: S.HashSet Int -> So.Env -> [(Candidates a, F.QualParam)] -> [[(SortIdx, QualPattern)]]
 matchP occupied env = go []
   where
     go' !i !p !is !qps  = go ((i, p):is) qps
@@ -269,20 +269,37 @@ applyQPP su qp = qp
 --   }
 
 --------------------------------------------------------------------------------
+-- | A kvar's candidate groups, each of a distinct sort, in instantiation
+--   order, and indexed by that sort.
+data Candidates a = Candidates
+  { candidateList   :: [(SortIdx, F.Sort, a)]
+  , candidateBySort :: M.HashMap F.Sort (SortIdx, F.Sort, a)
+  }
+
+candidates :: [(SortIdx, F.Sort, a)] -> Candidates a
+candidates tyss = Candidates tyss (M.fromList [ (t, entry) | entry@(_, t, _) <- tyss ])
+
 -- | @occupied@ must include the indices of every candidate sort in @tyss@ and
---   of the parameter's sort.
+--   of the parameter's sort. A monomorphic parameter unifies exactly with the
+--   one group of its own sort.
 candidatesP ::
   S.HashSet Int ->
   So.Env ->
-  [(SortIdx, F.Sort, a)] ->
+  Candidates a ->
   F.QualParam ->
   [(So.TVSubst, SortIdx, QualPattern)]
 --------------------------------------------------------------------------------
-candidatesP occupied env tyss x =
-  [ (su, idx, qPat)
-  | (idx, t, _) <- tyss
-  , su <- maybeToList (So.unifyFastCovered occupied mono env xt t)
-  ]
+candidatesP occupied env tyss x
+  | mono =
+      [ (su, idx, qPat)
+      | (idx, t, _) <- maybeToList (M.lookup xt (candidateBySort tyss))
+      , su <- maybeToList (So.unifyFastCovered occupied mono env xt t)
+      ]
+  | otherwise =
+      [ (su, idx, qPat)
+      | (idx, t, _) <- candidateList tyss
+      , su <- maybeToList (So.unifyFastCovered occupied mono env xt t)
+      ]
  where
   xt = F.qpSort x
   qPat = F.qpPat x
