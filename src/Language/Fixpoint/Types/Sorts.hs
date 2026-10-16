@@ -664,16 +664,30 @@ substituteSort symbolic indexed target
     -- Direct lookup needs no support inventory; the filtered image inventories
     -- above are demanded only for capture avoidance at a type binder.
     go :: M.HashMap Int Int -> HashSet Int -> Sort -> Sort
-    go _ _ t@(FObj x) = M.lookupDefault t x symbolic
-    go bound _ (FVar i) = case M.lookup i bound of
-        Just j -> FVar j
-        Nothing -> IM.findWithDefault (FVar i) i indexed
-    go bound used (FFunc x y) = FFunc (go bound used x) (go bound used y)
-    go bound used (FApp x y) = FApp (go bound used x) (go bound used y)
-    go bound used (FAbs i body) =
+    go bound used t = fromMaybe t (changed bound used t)
+
+    -- The rewritten sort, or Nothing when the substitution leaves it equal;
+    -- an unchanged subtree is then shared rather than rebuilt.
+    changed :: M.HashMap Int Int -> HashSet Int -> Sort -> Maybe Sort
+    changed _ _ (FObj x) = M.lookup x symbolic
+    changed bound _ (FVar i) = case M.lookup i bound of
+        Just j
+            | j == i -> Nothing
+            | otherwise -> Just (FVar j)
+        Nothing -> IM.lookup i indexed
+    changed bound used (FFunc x y) = both FFunc (changed bound used) x y
+    changed bound used (FApp x y) = both FApp (changed bound used) x y
+    changed bound used (FAbs i body) =
         let j = if HashSet.member i rangeFree then freshIndex used else i
-         in FAbs j (go (M.insert i j bound) (HashSet.insert j used) body)
-    go _ _ t = t
+         in case changed (M.insert i j bound) (HashSet.insert j used) body of
+                Nothing | j == i -> Nothing
+                image -> Just (FAbs j (fromMaybe body image))
+    changed _ _ _ = Nothing
+
+    both :: (Sort -> Sort -> Sort) -> (Sort -> Maybe Sort) -> Sort -> Sort -> Maybe Sort
+    both constructor step x y = case (step x, step y) of
+        (Nothing, Nothing) -> Nothing
+        (x', y') -> Just (constructor (fromMaybe x x') (fromMaybe y y'))
 
     freshIndex :: HashSet Int -> Int
     freshIndex used = search 0
