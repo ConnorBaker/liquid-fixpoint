@@ -1175,8 +1175,17 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
                             whole = replacementFree `S.union` S.unions (map cFree others)
                             step c
                                 | cSimple c && not (S.member name (cFree c)) = [c]
-                                | cSimple c = annotate (conjuncts scope (F.substr (replacementFree `S.union` cFree c) substitution (cExpr c)))
+                                | cSimple c = substituted (S.delete name (cFree c) `S.union` replacementFree) (F.substr (replacementFree `S.union` cFree c) substitution (cExpr c))
                                 | otherwise = annotate (conjuncts scope (F.substr whole substitution (cExpr c)))
+                            -- Replacing the free occurrences of the name in a
+                            -- simple clause that mentions it removes that name
+                            -- and adds the replacement's free names, and the
+                            -- result is simple exactly when the replacement is.
+                            -- Recomputing both would traverse the clause again
+                            -- after every witness it receives.
+                            substituted free value = case F.splitPAnd value of
+                                [clause] -> [Clause (witness clause) clause free (simpleExpr replacement) | not (trivial scope clause)]
+                                _ -> annotate (conjuncts scope value)
                          in eliminate (concatMap step others)
                     | otherwise -> project env bs (F.subst1 (F.conj (map cExpr (before ++ after))) binding)
                 _ -> F.pExist (filter ((`S.member` F.syms residual) . fst) bs) residual
@@ -1206,12 +1215,12 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
     ascribe F.FReal e = e
     ascribe sort e = F.ECst e sort
 
-    conjuncts env = filter (not . trivial) . F.splitPAnd
+    conjuncts env = filter (not . trivial env) . F.splitPAnd
+
+    trivial _ F.PTrue = True
+    trivial _ F.PTop = True
+    trivial env (F.PAtom F.Eq left right) = sourceIdentity (identityCast left) (identityCast right)
       where
-        trivial F.PTrue = True
-        trivial F.PTop = True
-        trivial (F.PAtom F.Eq left right) = sourceIdentity (identityCast left) (identityCast right)
-        trivial _ = False
         -- This is only an equality proof, not a rewrite of the retained term.
         -- Read the variable's uninstantiated sort: opening a declaration scheme
         -- here would forget which occurrence-specific type application was used.
@@ -1222,6 +1231,7 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
             , sourceIdentity (close source) (close sort) =
                 variable
         identityCast e = e
+    trivial _ _ = False
 
     floatConjuncts env original@(F.PExist bs e)
         | null independent = [original]
