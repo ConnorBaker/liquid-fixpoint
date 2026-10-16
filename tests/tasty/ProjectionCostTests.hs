@@ -12,10 +12,15 @@
 -- witnesses must not double the allocation of the projection. Re-traversing
 -- them at every step makes the allocation proportional to the witness count
 -- (a ratio near 2); traversing them once leaves it nearly constant.
+--
+-- A clause that a witness does change is substituted, which copies it. Its
+-- free names then differ only by the eliminated name and the replacement's
+-- names; collecting them from the copy again costs several times the copy.
 module ProjectionCostTests (tests) where
 
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
+import qualified Data.List as List
 import qualified Language.Fixpoint.Solver.Solution as F
 import qualified Language.Fixpoint.Types as F
 import System.Mem (getAllocationCounter, performMajorGC)
@@ -43,11 +48,33 @@ tests =
               ++ show bound
           )
           (ratio < bound)
+    , testCase "projection substitutes every witness into the clause that mentions them all" $
+        F.simplifyKVar declarations mempty sharedInput @?= sharedExpected
+    , testCase "a clause that receives a witness updates its names rather than collecting them again" $ do
+        projected <- allocationOf (F.simplifyKVar declarations mempty) sharedInput
+        substituted <- allocationOf substituteAll sharedClause
+        let ratio = fromIntegral projected / fromIntegral substituted :: Double
+        assertBool
+          ( "projection allocated "
+              ++ show ratio
+              ++ "x the substitutions it performs ("
+              ++ show projected
+              ++ " vs "
+              ++ show substituted
+              ++ " bytes); bound is "
+              ++ show sharedBound
+          )
+          (ratio < sharedBound)
     ]
   where
     -- Re-traversal gives a ratio near 2; a single traversal near 1. The
     -- midpoint leaves margin for optimisation-level differences either way.
     bound = 1.5
+    -- Each witness is substituted into the shared clause, so projection
+    -- copies that clause once per witness, like 'substituteAll'. Collecting
+    -- the clause's free names again after each copy as well builds a set of
+    -- all its names per witness, several times the copy's allocation.
+    sharedBound = 2
 
 witnessesSmall, witnessesLarge, clauseCount, clauseSize :: Int
 witnessesSmall = 40
@@ -91,3 +118,48 @@ allocation e = do
   result @?= expected
   -- The counter counts down.
   pure (fromIntegral (before - after))
+
+-- | One clause mentioning every witness and many other distinct names. Each
+-- witness projection substitutes into it; its free names change only by the
+-- eliminated name and the replacement's names.
+sharedNames, sharedWitnesses :: Int
+sharedNames = 4000
+sharedWitnesses = 40
+
+sharedWitnessNames :: [F.Symbol]
+sharedWitnessNames = witnessNames sharedWitnesses
+
+sharedClause :: F.Expr
+sharedClause =
+  F.PAtom F.Gt
+    (foldr1 (F.EBin F.Plus) (map F.EVar (sharedWitnessNames ++ [F.symbol ("a" ++ show i) | i <- [1 .. sharedNames]])))
+    (F.ECon (F.I 0))
+
+sharedValues :: [(F.Symbol, F.Expr)]
+sharedValues = [(x, F.ECon (F.I (fromIntegral i))) | (i, x) <- zip [1 :: Int ..] sharedWitnessNames]
+
+sharedInput :: F.Expr
+sharedInput =
+  F.PExist
+    [(x, F.FInt) | x <- sharedWitnessNames]
+    (F.PAnd ([F.PAtom F.Eq (F.EVar x) value | (x, value) <- sharedValues] ++ [sharedClause]))
+
+-- | The witnesses' substitutions, one at a time, under a scope computed once.
+substituteAll :: F.Expr -> F.Expr
+substituteAll clause = List.foldl' step clause sharedValues
+  where
+    scope = F.syms clause
+    step current binding = F.substr scope (F.mkSubst [binding]) current
+
+sharedExpected :: F.Expr
+sharedExpected = substituteAll sharedClause
+
+allocationOf :: (F.Expr -> F.Expr) -> F.Expr -> IO Integer
+allocationOf function e = do
+  inputE <- evaluate (force e)
+  performMajorGC
+  start <- getAllocationCounter
+  _ <- evaluate (force (function inputE))
+  end <- getAllocationCounter
+  -- The counter counts down.
+  pure (fromIntegral (start - end))

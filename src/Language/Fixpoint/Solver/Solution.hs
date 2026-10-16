@@ -801,14 +801,24 @@ nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (ex
     definitions = M.fromList [(F.eqName equation, equation) | equation <- defined]
     -- A defining cube is a complete constraint environment. Its body and
     -- actual admission use that environment, not an ancestor's witnesses.
-    -- Keep every equality and close every witness at EVERY nested definition
-    -- (including common sScp binders; see upstream issue #808).
-    select environment _ cube =
-        ( (combinedEnv info scope bindings (ceSpan environment) F.emptyIBindEnv mempty){ceFixed = ceFixed environment}
-        , bindings
+    -- Keep every equality (upstream issue #808) and close every witness,
+    -- except a common binder of the KVar ('Sol.sScp', Section 2.4 of "Local
+    -- Refinement Typing", ICFP 2017) that the occurrence's environment
+    -- already binds. That binder encloses every constraint of the KVar, and
+    -- the enclosing definition quantifies and asserts it under the same
+    -- name; the nested definition takes it as a parameter, like the SMT
+    -- observation and upstream's export, which omit common binders. Closing
+    -- it again copied the global environment into every nested definition.
+    -- The exported KVar occurs in an empty environment, so it closes its
+    -- complete environment.
+    select environment variable cube =
+        ( (bindLocalSorts (symSorts environment enclosing) (combinedEnv info scope bindings (ceSpan environment) F.emptyIBindEnv mempty)){ceFixed = ceFixed environment}
+        , F.diffIBindEnv bindings enclosing
         )
       where
         bindings = Sol.cuBinds cube
+        common = Misc.safeLookup "sScp" variable (Sol.sScp solution)
+        enclosing = F.intersectionIBindEnv common (F.intersectionIBindEnv bindings (ceIEnv environment))
 
 {- | At the moment, the liquid-fixpoint implementation allows for unsorted
 expressions in substitutions. See the discussion in
@@ -1165,8 +1175,17 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
                             whole = replacementFree `S.union` S.unions (map cFree others)
                             step c
                                 | cSimple c && not (S.member name (cFree c)) = [c]
-                                | cSimple c = annotate (conjuncts scope (F.substr (replacementFree `S.union` cFree c) substitution (cExpr c)))
+                                | cSimple c = substituted (S.delete name (cFree c) `S.union` replacementFree) (F.substr (replacementFree `S.union` cFree c) substitution (cExpr c))
                                 | otherwise = annotate (conjuncts scope (F.substr whole substitution (cExpr c)))
+                            -- Replacing the free occurrences of the name in a
+                            -- simple clause that mentions it removes that name
+                            -- and adds the replacement's free names, and the
+                            -- result is simple exactly when the replacement is.
+                            -- Recomputing both would traverse the clause again
+                            -- after every witness it receives.
+                            substituted free value = case F.splitPAnd value of
+                                [clause] -> [Clause (witness clause) clause free (simpleExpr replacement) | not (trivial scope clause)]
+                                _ -> annotate (conjuncts scope value)
                          in eliminate (concatMap step others)
                     | otherwise -> project env bs (F.subst1 (F.conj (map cExpr (before ++ after))) binding)
                 _ -> F.pExist (filter ((`S.member` F.syms residual) . fst) bs) residual
@@ -1196,12 +1215,12 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
     ascribe F.FReal e = e
     ascribe sort e = F.ECst e sort
 
-    conjuncts env = filter (not . trivial) . F.splitPAnd
+    conjuncts env = filter (not . trivial env) . F.splitPAnd
+
+    trivial _ F.PTrue = True
+    trivial _ F.PTop = True
+    trivial env (F.PAtom F.Eq left right) = sourceIdentity (identityCast left) (identityCast right)
       where
-        trivial F.PTrue = True
-        trivial F.PTop = True
-        trivial (F.PAtom F.Eq left right) = sourceIdentity (identityCast left) (identityCast right)
-        trivial _ = False
         -- This is only an equality proof, not a rewrite of the retained term.
         -- Read the variable's uninstantiated sort: opening a declaration scheme
         -- here would forget which occurrence-specific type application was used.
@@ -1212,6 +1231,7 @@ simplifyKVarWithin covered declarations locals = conjoin . floatConjuncts locals
             , sourceIdentity (close source) (close sort) =
                 variable
         identityCast e = e
+    trivial _ _ = False
 
     floatConjuncts env original@(F.PExist bs e)
         | null independent = [original]
