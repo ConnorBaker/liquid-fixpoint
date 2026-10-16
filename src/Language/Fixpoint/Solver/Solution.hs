@@ -801,14 +801,24 @@ nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (ex
     definitions = M.fromList [(F.eqName equation, equation) | equation <- defined]
     -- A defining cube is a complete constraint environment. Its body and
     -- actual admission use that environment, not an ancestor's witnesses.
-    -- Keep every equality and close every witness at EVERY nested definition
-    -- (including common sScp binders; see upstream issue #808).
-    select environment _ cube =
-        ( (combinedEnv info scope bindings (ceSpan environment) F.emptyIBindEnv mempty){ceFixed = ceFixed environment}
-        , bindings
+    -- Keep every equality (upstream issue #808) and close every witness,
+    -- except a common binder of the KVar ('Sol.sScp', Section 2.4 of "Local
+    -- Refinement Typing", ICFP 2017) that the occurrence's environment
+    -- already binds. That binder encloses every constraint of the KVar, and
+    -- the enclosing definition quantifies and asserts it under the same
+    -- name; the nested definition takes it as a parameter, like the SMT
+    -- observation and upstream's export, which omit common binders. Closing
+    -- it again copied the global environment into every nested definition.
+    -- The exported KVar occurs in an empty environment, so it closes its
+    -- complete environment.
+    select environment variable cube =
+        ( (bindLocalSorts (symSorts environment enclosing) (combinedEnv info scope bindings (ceSpan environment) F.emptyIBindEnv mempty)){ceFixed = ceFixed environment}
+        , F.diffIBindEnv bindings enclosing
         )
       where
         bindings = Sol.cuBinds cube
+        common = Misc.safeLookup "sScp" variable (Sol.sScp solution)
+        enclosing = F.intersectionIBindEnv common (F.intersectionIBindEnv bindings (ceIEnv environment))
 
 {- | At the moment, the liquid-fixpoint implementation allows for unsorted
 expressions in substitutions. See the discussion in
