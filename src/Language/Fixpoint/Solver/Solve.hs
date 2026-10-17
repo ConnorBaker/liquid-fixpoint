@@ -21,7 +21,7 @@ import qualified Language.Fixpoint.Types           as F
 import qualified Language.Fixpoint.Types.Solutions as Sol
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Config hiding (stats)
-import           Language.Fixpoint.SortCheck          (ElabParam(..), elaborate, unApply, unElab)
+import           Language.Fixpoint.SortCheck          (ElabParam(..), elaborate, unApply, unElab, unToInt)
 import           Language.Fixpoint.Solver.Sanitize (symbolEnv)
 import qualified Language.Fixpoint.Solver.Solution  as S
 import qualified Language.Fixpoint.Smt.Types as T
@@ -173,6 +173,8 @@ solve_ cfg source scope sourceScopes fi s2 wkl = do
 --------------------------------------------------------------------------------
 {- | Project solutions in their canonical typed scope before choosing whether
 to retain casts. Presentation preserves the predicate's binding identities.
+It inverts both elaboration encodings, apply and the ordering cast to int,
+so a presented solution contains no elaboration-only symbol.
 -}
 
 --------------------------------------------------------------------------------
@@ -183,7 +185,7 @@ tidyResult cfg declarations r =
         , F.resNonCutsSolution = M.mapWithKey (\k -> fmap (project k)) (F.resNonCutsSolution r)
         }
   where
-    project k = present . S.simplifyKVar declarations (F.fromListSEnv [(F.formalCanonical f, F.formalSort f) | f <- M.lookupDefault [] k (F.resScopes r)]) . unApply
+    project k = present . S.simplifyKVar declarations (F.fromListSEnv [(F.formalCanonical f, F.formalSort f) | f <- M.lookupDefault [] k (F.resScopes r)]) . unToInt . unApply
     present = if sortedSolution cfg then id else unElab
 
 --------------------------------------------------------------------------------
