@@ -73,6 +73,7 @@ module Language.Fixpoint.SortCheck  (
   , unApplySortedReft
   , unApplyAt
   , toInt
+  , unToInt
 
   -- * Predicates on Sorts
   , isFirstOrder
@@ -1049,6 +1050,22 @@ isNum env s = case sortSmtSort False env s of
 
 toIntAt :: Sort -> Expr
 toIntAt s = ECst (EVar toIntName) (FFunc s FInt)
+
+-- | Inverse of 'toInt': restore each sorted operand that elaboration passed
+-- through the elaboration-only 'toIntName' cast to order it. A presented
+-- expression is then re-elaborated by its consumer, which reinserts the cast.
+-- The cast is matched with its integer result annotation first, then bare:
+-- 'unApply' drops that annotation when the application was defunctionalized.
+unToInt :: Expr -> Expr
+unToInt = Vis.mapExprOnExpr bare . Vis.mapExprOnExpr annotated
+  where
+    annotated (ECst application FInt)
+        | Just operand <- cast application = operand
+    annotated e = e
+    bare e = fromMaybe e (cast e)
+    cast (EApp (ECst (EVar f) (FFunc _ FInt)) operand)
+        | f == toIntName = Just operand
+    cast _ = Nothing
 
 unElab :: Expr -> Expr
 unElab = Vis.stripCasts . unApply
