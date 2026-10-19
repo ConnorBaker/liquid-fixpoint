@@ -793,7 +793,17 @@ nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (ex
     export variable =
         let occurrence = F.KVS (F.vv Nothing) F.boolSort variable (F.toKVarSubst M.empty) mempty
             (predicate, final) = St.runState (sharedKVar select cfg g solution occurrence) initial
-         in bindSummaries (summaryBodies final <> definitions) (F.syms predicate) predicate
+            exported = bindSummaries (summaryBodies final <> definitions) (F.syms predicate) predicate
+            own = S.fromList (F.kvarDomain info variable)
+            foreign = (F.syms exported `S.intersection` summaryFormals initial) `S.difference` own
+         in F.pExist [(x, sort) | x <- List.sort (S.toList foreign), Just sort <- [F.lookupSEnv x (summaryParameterSorts initial)]] exported
+    -- A nested occurrence's actual is admitted in its defining environment,
+    -- which binds only that cube's binders. An implicit actual naming a binder
+    -- outside it (in scope in the query, as every BindEnv name is) is dropped
+    -- as unsorted, leaving that kvar's formal free. Within the query the formal
+    -- is a declared binder; an exported solution is interpreted in another
+    -- query, where it names nothing. It stands for an unknown value of its
+    -- sort, so close it, as the defining cube's own binders are closed.
     -- Query definitions, including lexical functions lifted by sanitization,
     -- exist only in this solver's SMT context. Like eliminated summaries, an
     -- export carries those it uses, so it keeps its meaning in another query.
