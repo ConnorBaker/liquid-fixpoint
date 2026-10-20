@@ -206,13 +206,23 @@ instKSig :: KEnv
          -> [[F.Symbol]]
 instKSig _ [] = error "Empty qsig in Solution.instKSig"
 instKSig (KEnv vvTyss tyss symToSrch occupied) (qp:qps) = do
-  ixs    <- matchP occupied symToSrch (vvQP : restQPs)
+  guard (all viable params)
+  ixs    <- matchP occupied symToSrch params
   x : ys <- instSymbol (candidateList vvTyss ++ candidateList tyss) (reverse ixs)
   guard (x `notElem` ys)
   return (x : ys)
   where
     vvQP       = (vvTyss, qp { F.qpPat = F.PatNone })
     restQPs    = [ (tyss, qp') | qp' <- qps ]
+    params     = vvQP : restQPs
+    -- matchP solves the parameters in order and applies each solution to the
+    -- rest, so it can enumerate every combination of the earlier parameters'
+    -- sorts before finding that a later one has no candidate. A substitution
+    -- only specializes a parameter's sort: one that unifies with no candidate
+    -- sort on its own unifies with none after any substitution either, so its
+    -- qualifier has no instance in this environment.
+    covered    = occupied `S.union` paramIndices (map snd params)
+    viable (candidateSorts, param) = not (null (candidatesP covered symToSrch candidateSorts param))
 
 instSymbol :: [(SortIdx, a, [F.Symbol])] -> [(SortIdx, QualPattern)] -> [[F.Symbol]]
 instSymbol tyss = go

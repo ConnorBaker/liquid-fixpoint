@@ -9,13 +9,14 @@ import Control.Monad.Reader (runReader)
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
 import Data.Maybe (isNothing)
+import GHC.Conc (getAllocationCounter)
 import qualified Language.Fixpoint.Solver.Solution as Solution
 import qualified Language.Fixpoint.SortCheck as C
 import qualified Language.Fixpoint.Types as F
 import qualified Language.Fixpoint.Types.Config as Config
 import qualified Language.Fixpoint.Types.Solutions as Sol
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, testCase, (@?=))
 
 -- Root and child contexts share immutable inventories without sharing judgments.
 tests :: TestTree
@@ -43,6 +44,28 @@ tests =
                 candidates sort = Sol.qbExprs (Solution.init Config.defConfig (information sort) (S.singleton kvar) M.! kvar)
             candidates (F.FObj "alias") @?= [equal (F.EVar "x") zero]
             candidates F.boolSort @?= []
+        , testCase "a parameter no candidate sort admits prunes its qualifier before the others are enumerated" $ do
+            -- An abstract-refinement qualifier over three sort variables and a
+            -- Pred of them. No constant has a Pred sort, so it has no instance;
+            -- without the prune the solver still enumerated every pair of
+            -- candidate sorts for x and y (and, for polymorphic ones, scanned
+            -- every candidate for p) before discovering that.
+            let kvar = F.KV "unviable-higher-order"
+                width = 120 :: Int
+                box i = F.fAppTC (F.symbolFTycon (F.dummyLoc (F.symbol ("Box" ++ show i)))) [F.FVar 0]
+                sorts = concat [[F.FObj (F.symbol ("T" ++ show i)), box i] | i <- [1 .. width]]
+                constants = F.fromListSEnv [(F.symbol ("c" ++ show i), sort) | (i, sort) <- zip [1 :: Int ..] sorts]
+                predicate = F.fAppTC (F.symbolFTycon (F.dummyLoc "Pred")) [F.FVar 0, F.FVar 1, F.FVar 2]
+                unviable = F.mkQ "Unviable" [("v", F.FVar 0), ("x", F.FVar 1), ("y", F.FVar 2), ("p", predicate)] F.PTrue (F.dummyPos "unviable")
+                viable = F.mkQ "Viable" [("v", F.FVar 0), ("x", F.FVar 0)] (equal (F.EVar "v") (F.EVar "x")) (F.dummyPos "viable")
+                information qualifiers = mempty{F.gLits = constants, F.ws = M.singleton kvar (F.WfC mempty [("v", F.FObj "T1")] kvar ()), F.quals = qualifiers} :: F.SInfo ()
+                instances qualifiers = Sol.qbExprs (Solution.init Config.defConfig (information qualifiers) (S.singleton kvar) M.! kvar)
+            before <- getAllocationCounter
+            count <- evaluate (length (instances [unviable]))
+            after <- getAllocationCounter
+            count @?= 0
+            assertBool ("instantiating the unviable qualifier allocated " ++ show (before - after) ++ " bytes") (before - after < 64 * 1024 * 1024)
+            instances [unviable, viable] @?= instances [viable]
         , testCase "a zero-value WF retains the false candidate" $ do
             let kvar = F.KV "zero-values"
                 information = mempty{F.ws = M.singleton kvar (F.WfC mempty [] kvar ())} :: F.SInfo ()
