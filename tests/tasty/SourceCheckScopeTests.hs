@@ -47,8 +47,21 @@ qualifierTests =
             assertBool "local variable escaped" (all (S.null . F.syms) qs)
         , testCase "disabled scraping remains empty" $
             Horn.scrapeFInfo Config.defConfig Config.No (qualifierQuery missing mempty) @?= []
+        , testCase "nonlinear arithmetic over symbols is not a candidate" $
+            mapM_
+                (\op -> scrapeArithmetic (F.EBin op (F.EVar "x") (F.EVar "y")) @?= [])
+                [F.Times, F.Div, F.Mod]
+        , testCase "arithmetic with a literal operand remains a candidate" $
+            mapM_
+                (\op -> assertBool (show op ++ " by a literal was lost") (not (null (scrapeArithmetic (F.EBin op (F.EVar "x") (F.ECon (F.I 4)))))))
+                [F.Times, F.Div, F.Mod]
         ]
   where
+    scrapeArithmetic e =
+        Horn.scrapeFInfo
+            Config.defConfig
+            Config.Both
+            (qualifierQuery (F.PAtom F.Eq (F.EVar "v") e) (F.fromListSEnv [("x", F.FInt), ("y", F.FInt)]))
     missing = F.PAtom F.Eq (F.EVar "v") (F.EVar "external")
     closed info = all (`F.memberSEnv` C.globalEnv Config.defConfig info) . F.syms
 

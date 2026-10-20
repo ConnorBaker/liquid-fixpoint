@@ -261,8 +261,22 @@ mkQualParams :: [(F.Symbol, F.Sort)] -> F.Expr -> [F.Qualifier]
 mkQualParams xts e
   -- Qualifiers are fixed predicates, not definitions of the unknowns whose
   -- source constraints we are mining. Leave those constraints untouched.
-  | V.isConc e = [mkScrapeQual xts' e | xts' <- shiftCycle xts]
+  | V.isConc e && linearArithmetic e = [mkScrapeQual xts' e | xts' <- shiftCycle xts]
   | otherwise = []
+
+-- | A scraped template is checked for every instantiation of its parameters,
+-- one validity query per candidate. A product, quotient or remainder whose
+-- operands both mention symbols is nonlinear integer arithmetic, a fragment in
+-- which the solver's validity check need not terminate, and an undecided
+-- check stops the whole query. A literal operand keeps the operation linear.
+linearArithmetic :: F.Expr -> Bool
+linearArithmetic = null . V.fold folder () []
+  where
+    folder = (V.defaultFolder :: V.Folder [()] ()) { V.accExpr = nonlinear }
+    nonlinear _ (F.EBin op left right)
+      | op `elem` [F.Times, F.RTimes, F.Div, F.RDiv, F.Mod] && not (closed left || closed right) = [()]
+    nonlinear _ _ = []
+    closed = S.null . F.syms
 
 mkScrapeQual :: [(F.Symbol, F.Sort)] -> F.Expr -> F.Qualifier
 mkScrapeQual xts e = F.mkQual (F.symbol "AUTO") qParams body (F.dummyPos "")
