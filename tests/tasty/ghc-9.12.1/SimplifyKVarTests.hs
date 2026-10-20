@@ -173,6 +173,19 @@ projectionTests =
       mapM_ (assertPredicate environment mempty) [inputE, actual]
       F.syms actual @?= F.syms expectedE
       assertBool "capture-avoiding result" (F.alphaEq S.empty actual expectedE)
+  , -- A KVar application's formals that its substitution does not name are
+    -- implicit actuals: they read the same-named binder in scope. A witness
+    -- read that way is not mentioned by the application's free names, but
+    -- eliminating it must still substitute its replacement into the
+    -- application; dropping the witness's equality instead would leave the
+    -- application reading whatever binder of that name encloses the result.
+    testCase "a witness that a KVar application reads implicitly is substituted into it" $ do
+      let environment = F.fromListSEnv [("c", F.FInt)]
+          application = F.PKVar (F.KV "k") mempty mempty
+          inputE = existsInt (F.PAnd [equal x (F.EVar "c"), application])
+          actual = F.simplifyKVar environment mempty inputE
+      assertBool ("the replacement reaches the application: " ++ F.showpp actual) (S.member "c" (F.syms actual))
+      assertBool ("the application is not left reading an unbound witness: " ++ F.showpp actual) (actual /= application)
   ]
  where
   x = F.EVar "x"
