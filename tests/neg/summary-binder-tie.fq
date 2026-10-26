@@ -1,0 +1,62 @@
+// Two eliminated KVars, $k1 and $k2, have a WF binder x, bound by different
+// bindings: x = 0 for $k1, x = 1 for $k2. $k3 and $k4 are defined from them
+// in clauses that bind no x, so each use leaves its x actual implicit, and
+// the goal clause binds no x either. Clause by clause p and q are both 1, so
+// p = q + 1 is false: UNSAFE. One sort per name is not one binder per name:
+// admitting the implicit x because some binding of the query declares it
+// reads both summaries' x as one free constant, so the goal's premises say
+// x = 0 and x = 1 and the query is reported SAFE. Each x binding is stated
+// as two bounds so that environment reduction, which drops a `v = e`
+// binding nothing names, keeps $k1's and $k2's x formal.
+bind 0 x : {v : int | v >= 0 && v <= 0}
+bind 1 x : {v : int | v >= 1 && v <= 1}
+bind 2 a : {v : int | $k1[v := a]}
+bind 3 b : {v : int | $k2[v := b]}
+bind 4 p : {v : int | $k3[v := p]}
+bind 5 q : {v : int | $k4[v := q]}
+
+constraint:
+  env [0]
+  lhs {v : int | v = 1}
+  rhs {v : int | $k1}
+  id 1 tag []
+
+constraint:
+  env [1]
+  lhs {v : int | v = 1}
+  rhs {v : int | $k2}
+  id 2 tag []
+
+constraint:
+  env [2]
+  lhs {v : int | v = a}
+  rhs {v : int | $k3}
+  id 3 tag []
+
+constraint:
+  env [3]
+  lhs {v : int | v = b}
+  rhs {v : int | $k4}
+  id 4 tag []
+
+constraint:
+  env [4; 5]
+  lhs {v : int | v = p}
+  rhs {v : int | p = q + 1}
+  id 5 tag []
+
+wf:
+  env [0]
+  reft {v : int | $k1}
+
+wf:
+  env [1]
+  reft {v : int | $k2}
+
+wf:
+  env [ ]
+  reft {v : int | $k3}
+
+wf:
+  env [ ]
+  reft {v : int | $k4}

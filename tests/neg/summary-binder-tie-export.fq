@@ -1,0 +1,68 @@
+// summary-binder-tie.fq's two uses meet inside one eliminated KVar, $k5,
+// whose exported solution closes x once for both. Clause by clause $k5 is
+// v = 1, so the goal r = 2 is false: UNSAFE. Reading both uses' implicit x
+// as one binder makes the export false (x = 0 and x = 1), and with it every
+// clause that assumes $k5, so the query is reported SAFE.
+bind 0 x : {v : int | v >= 0 && v <= 0}
+bind 1 x : {v : int | v >= 1 && v <= 1}
+bind 2 a : {v : int | $k1[v := a]}
+bind 3 b : {v : int | $k2[v := b]}
+bind 4 p : {v : int | $k3[v := p]}
+bind 5 q : {v : int | $k4[v := q]}
+bind 6 r : {v : int | $k5[v := r]}
+
+constraint:
+  env [0]
+  lhs {v : int | v = 1}
+  rhs {v : int | $k1}
+  id 1 tag []
+
+constraint:
+  env [1]
+  lhs {v : int | v = 1}
+  rhs {v : int | $k2}
+  id 2 tag []
+
+constraint:
+  env [2]
+  lhs {v : int | v = a}
+  rhs {v : int | $k3}
+  id 3 tag []
+
+constraint:
+  env [3]
+  lhs {v : int | v = b}
+  rhs {v : int | $k4}
+  id 4 tag []
+
+constraint:
+  env [4; 5]
+  lhs {v : int | v = p + q - q}
+  rhs {v : int | $k5}
+  id 5 tag []
+
+constraint:
+  env [6]
+  lhs {v : int | v = r}
+  rhs {v : int | r = 2}
+  id 6 tag []
+
+wf:
+  env [0]
+  reft {v : int | $k1}
+
+wf:
+  env [1]
+  reft {v : int | $k2}
+
+wf:
+  env [ ]
+  reft {v : int | $k3}
+
+wf:
+  env [ ]
+  reft {v : int | $k4}
+
+wf:
+  env [ ]
+  reft {v : int | $k5}
