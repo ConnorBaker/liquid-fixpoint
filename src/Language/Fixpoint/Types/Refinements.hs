@@ -824,9 +824,7 @@ instance (Ord b, Fixpoint b, Hashable b, PPrint b, Ord v, Fixpoint v, PPrint v) 
                                    pprintTidy k o         <+>
                                    pprintPrec (zo+1) k e2
     where zo = opPrec o
-  pprintPrec _ k (ELet x e1 e2)  = parens
-                                   "let"  <+> toFix x <+> "=" <+> pprintTidy  k e1  <+>
-                                   "in"   <+> pprintTidy k e2
+  pprintPrec _ k e@ELet{}        = pprintLets k e
 
   pprintPrec z k (EIte p e1 e2)  = parensIf (z > zi) $
                                    "if"   <+> pprintPrec (zi+1) k p  <+>
@@ -865,11 +863,39 @@ instance (Ord b, Fixpoint b, Hashable b, PPrint b, Ord v, Fixpoint v, PPrint v) 
     where za = 4
   pprintPrec z k (PAll xts p)    = parensIf (z > 0) $ pprintQuant k "forall" xts p
   pprintPrec z k (PExist xts p)  = parensIf (z > 0) $ pprintQuant k "exists" xts p
-  pprintPrec _ k (ELam (x,t) e)  = "lam" <+> toFix x <+> ":" <+> toFix t <+> text "." <+> pprintTidy k e
+  pprintPrec _ k e@ELam{}        = pprintLams k e
   pprintPrec _ k (ECoerc a t e)  = parens $ "coerce" <+> toFix a <+> "~" <+> toFix t <+> text "in" <+> pprintTidy k e
   pprintPrec _ _ p@PKVar{}    = toFix p
   pprintPrec _ _ (ETApp e s)     = "ETApp" <+> toFix e <+> toFix s
   pprintPrec _ _ (ETAbs e s)     = "ETAbs" <+> toFix e <+> toFix s
+
+-- Lets and lambdas print the same tokens as one horizontal run would, but
+-- their bodies do not hang from the end of the text before them. A body
+-- placed with '<+>' after a header indents each of its later lines to the
+-- header's end, so every line of a nested lambda-lifted definition (an
+-- exported eliminated summary) was indented by the width of all enclosing
+-- headers, and that padding, not the definitions, dominated the text. Here
+-- each definition of a let chain starts its own line, and a lambda chain's
+-- body follows its binders or sits under them, indented by two.
+
+-- | @(let) x1 = e1 in (let) x2 = e2 in ... in e@, one definition per line.
+pprintLets
+  :: (Ord b, Fixpoint b, Hashable b, PPrint b, Ord v, Fixpoint v, PPrint v)
+  => Tidy -> ExprBV b v -> Doc
+pprintLets k = go empty
+  where
+    go lead (ELet x e1 e2) = (lead <+> parens "let" <+> toFix x <+> "=" <+> pprintTidy k e1) $+$ go "in" e2
+    go lead e              = lead <+> pprintTidy k e
+
+-- | @lam x1 : t1 . ... lam xn : tn . e@: the binders on one line, and the
+-- body beside them when it fits and under them otherwise.
+pprintLams
+  :: (Ord b, Fixpoint b, Hashable b, PPrint b, Ord v, Fixpoint v, PPrint v)
+  => Tidy -> ExprBV b v -> Doc
+pprintLams k = go []
+  where
+    go binders (ELam (x, t) e) = go (("lam" <+> toFix x <+> ":" <+> toFix t <+> text ".") : binders) e
+    go binders e               = hang (hsep (reverse binders)) 2 (pprintTidy k e)
 
 pprintQuant
   :: (Ord b, Fixpoint b, Hashable b, PPrint b, Ord v, Fixpoint v, PPrint v)

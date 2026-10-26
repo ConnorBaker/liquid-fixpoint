@@ -39,6 +39,12 @@ tests =
                 save (saved 256) $ \large -> do
                     assertBool "padding must not dominate lexical definitions" (Bytes.length large < 256 * 300)
                     assertBool "four times the definitions must not square the wire size" (Bytes.length large < 5 * Bytes.length small)
+        , -- LiquidHaskell prints solutions in its error contexts with pprint,
+          -- in page mode, not with the saved file's LeftMode.
+          testCase "printed lexical sharing has a linear page-mode size" $ do
+            let printed depth = F.showpp (closure depth)
+            assertBool "four times the definitions must not square the printed size" (length (printed 256) < 5 * length (printed 64))
+            words (printed 64) @?= words (PJ.renderStyle PJ.style{PJ.mode = PJ.OneLineMode} (F.pprint (closure 64)))
         , testGroup "ordered comparisons of a non-numeric carrier" $
             [ testCase ("presented " ++ label ++ " solution has its source operands") $ do
                 (solution, formals) <- solved sorted
