@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module EliminatedSharingSupport (Fixture, cfg, check, valid, sym, var, int, binding, kvar, use) where
+module EliminatedSharingSupport (Fixture, cfg, check, valid, sym, var, int, binding, kvar, use, uniqified, genericSortNames) where
 
 import Control.Monad (forM_, unless)
+import qualified Data.Generics as Generics
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
+import qualified Data.Text as Text
 import qualified Language.Fixpoint.Smt.Interface as SMT
 import qualified Language.Fixpoint.Solver.Solution as Solution
 import qualified Language.Fixpoint.SortCheck as So
@@ -61,3 +63,26 @@ kvar = F.KV . sym "k"
 
 use :: Int -> F.Symbol -> F.Expr
 use index actual = F.PKVar (kvar index) mempty (F.toKVarSubst (M.singleton (sym "v" index) (var actual)))
+
+-- | The production domain of a summary observation: 'renameAll' renames
+-- bindings of one name with different sorts apart, and 'symbolEnv' (which
+-- the solver prepares before elaborating) rejects any name still declared
+-- with two sorts, so every name of a solved query has one sort.
+uniqified :: F.SInfo a -> Bool
+uniqified info = and [all (== sort) sorts | sort : sorts <- M.elems (M.fromListWith (++) [(name, [F.sr_sort refinement]) | (_, (name, refinement, _)) <- F.bindEnvToList (F.bs info)])]
+
+-- | The generic traversal that the structural 'V.exprFreeSortNames' replaced:
+-- the names of every sort the expression carries, less those its type
+-- abstractions bind.
+genericSortNames :: F.Expr -> S.HashSet F.Symbol
+genericSortNames = Generics.everythingBut S.union (Generics.mkQ (S.empty, False) sorts `Generics.extQ` scope `Generics.extQ` symbol `Generics.extQ` text)
+  where
+    sorts :: F.Sort -> (S.HashSet F.Symbol, Bool)
+    sorts sort = (F.sortSymbols sort, True)
+    scope :: F.Expr -> (S.HashSet F.Symbol, Bool)
+    scope (F.ETAbs body name) = (S.delete name (genericSortNames body), True)
+    scope _ = (S.empty, False)
+    symbol :: F.Symbol -> (S.HashSet F.Symbol, Bool)
+    symbol _ = (S.empty, True)
+    text :: Text.Text -> (S.HashSet F.Symbol, Bool)
+    text _ = (S.empty, True)

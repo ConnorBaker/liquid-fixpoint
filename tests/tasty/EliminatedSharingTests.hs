@@ -14,6 +14,7 @@ import qualified Language.Fixpoint.Graph as Graph
 import qualified Language.Fixpoint.Smt.Interface as SMT
 import qualified Language.Fixpoint.Solver as Solver
 import qualified Language.Fixpoint.Solver.Eliminate as Eliminate
+import qualified Language.Fixpoint.Solver.Sanitize as Sanitize
 import qualified Language.Fixpoint.Solver.Solution as Solution
 import qualified Language.Fixpoint.SortCheck as So
 import qualified Language.Fixpoint.Types as F
@@ -25,6 +26,7 @@ import SortInventoryTests (allocationBytes)
 import qualified SummaryScopeTests
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, assertEqual, assertFailure, testCase, testCaseInfo, (@?=))
+import Test.Tasty.QuickCheck (Property, elements, forAll, sublistOf, testProperty, vectorOf, withMaxSuccess, (===), (==>))
 
 tests :: TestTree
 tests =
@@ -146,7 +148,9 @@ tests =
                , testGroup
                     "repeated actuals share their declaration scope"
                     [testCaseInfo ("explicit KVars: " ++ show explicit) (declarationAllocation explicit) | explicit <- [False, True]]
-               , testCase "declaration preparation preserves scope extension and duplicate owners" declarationScopes
+               , testCase "declaration preparation preserves scope extension and shared owners" declarationScopes
+               , testProperty "occurrence declarations reach the cubes that look them up" declarationPlacements
+               , testCase "queries with a name of two sorts are outside the solver's domain" multiSortedQueries
                , testCase "query inventory does not share predicate definitions" inventorySolutions
                , testCase "forcing Result preserves optional delayed body" $ do
                     _ <- evaluate (force delayedResult)
@@ -290,7 +294,7 @@ inventoryAllocation = do
 observedNamesAllocation :: IO String
 observedNamesAllocation = do
     _ <- evaluate (force (small, large))
-    generic <- allocationBytes (V.exprFreeSortNames large)
+    generic <- allocationBytes (genericSortNames large)
     smallBytes <- observe small
     largeBytes <- observe large
     let message = "small/large observations and one generic traversal allocated " ++ show (smallBytes, largeBytes, generic)
@@ -351,6 +355,10 @@ declarationAllocation explicit = do
             _ -> assertFailure "repeated actuals did not share one definition"
         pure bytes
 
+-- | Law 3 on the solver's domain ('uniqified': one sort per name). A cube's
+-- actual is admitted in its occurrence's environment extended with the cube's
+-- bindings, whichever of them declares a name. The expected admission is the
+-- sort judgment in that extended environment.
 declarationScopes :: Assertion
 declarationScopes =
     forM_ cases $ \(label, caller, defining, actual) -> do
@@ -358,10 +366,9 @@ declarationScopes =
                 F.bindEnvFromList
                     [ binding 0 "alpha" F.FNum F.PTrue
                     , binding 1 "x" F.FInt F.PTrue
-                    , binding 2 "x" F.boolSort F.PTrue
                     , binding 3 "formal" F.boolSort F.PTrue
                     , binding 4 "target" F.boolSort (F.PKVar (kvar 0) mempty mempty)
-                    , binding 5 "alpha" F.FFrac F.PTrue
+                    , binding 5 "alpha" F.FNum F.PTrue
                     ]
             cube = Sol.Cube (F.fromListIBindEnv defining) (F.mkSubst [("formal", actual)]) 0 []
             info = mempty{F.bs = bindings, F.ws = M.singleton (kvar 0) (F.WfC mempty [("formal", F.boolSort)] (kvar 0) ())}
@@ -375,19 +382,91 @@ declarationScopes =
             (definitions, predicate) = Solution.lhsPredShared cfg initial scope mempty info solution constraint
             define equation = F.ELet (F.eqName equation) (foldr F.ELam (F.eqBody equation) (F.eqArgs equation))
             expanded = Solution.lhsPred cfg scope mempty info solution constraint
+        assertBool "the query is uniqified" (uniqified info)
         forM_ [expanded, foldr define predicate definitions] $ \body ->
             assertEqual label expected (S.member "formal" (F.syms body))
   where
+    numeric = F.EEq (F.ECst (int 0) (F.FObj "alpha")) (int 0)
     cases =
-        [ ("new numeric declaration is visible", [], [0], F.EEq (F.ECst (int 0) (F.FObj "alpha")) (int 0))
+        [ ("new numeric declaration is visible", [], [0], numeric)
         , ("new numeric declaration does not admit Bool", [], [0], F.EEq (F.ECst F.PTrue (F.FObj "alpha")) F.PTrue)
+        , ("caller's numeric declaration is visible", [0], [], numeric)
+        , ("undeclared sort name is not admitted", [], [], numeric)
+        , ("caller's term declaration is visible", [1], [], F.EEq (F.ECst (var "x") F.FInt) (int 0))
+        , ("caller's term declaration keeps its sort", [1], [], F.EEq (F.ECst (var "x") F.boolSort) F.PTrue)
         ]
-            ++ [ ("duplicate declaration " ++ show sort, [1, 2], [], F.EEq (F.ECst (var "x") sort) value)
-               | (sort, value) <- [(F.FInt, int 0), (F.boolSort, F.PTrue)]
-               ]
-            ++ [ ("split numeric declaration " ++ show caller, caller, defining, F.EEq (F.EBin F.Mod (F.ECst (int 0) (F.FObj "alpha")) (int 1)) (int 0))
+            ++ [ ("shared numeric declaration " ++ show caller, caller, defining, F.EEq (F.EBin F.Mod (F.ECst (int 0) (F.FObj "alpha")) (int 1)) (int 0))
                | (caller, defining) <- [([0], [5]), ([5], [0])]
                ]
+
+-- | Law 3 over generated uniqified queries. With one sort per name, a sort
+-- judgment depends on its environment only through which names it declares:
+-- each lookup either finds the name's one sort or fails. The generator places
+-- every pool name in each of the eight subsets of {occurrence, $k0's defining
+-- cube, the nested $k1's defining cube}, and gives both cubes actuals that
+-- look names up in each way admission reads an environment: as a term (n0),
+-- as a numeric sort annotation (n1, n2), and through another declaration's
+-- sort (n3 : n1). Shared and unfolded observations admit the same actuals.
+declarationPlacements :: Property
+declarationPlacements =
+    withMaxSuccess 2000 $
+        forAll placements $ \placed ->
+            let (info, solution, constraint) = placementQuery placed
+                scope = S.fromList [name | (_, (name, _, _)) <- F.bindEnvToList (F.bs info)]
+                (definitions, predicate) = Solution.lhsPredShared cfg (Solution.prepareSummaryState scope info) scope mempty info solution constraint
+                define equation = F.ELet (F.eqName equation) (foldr F.ELam (F.eqBody equation) (F.eqArgs equation))
+                admitted :: F.Expr -> S.HashSet F.Symbol
+                admitted body = S.intersection (F.syms body) (S.fromList ["f0", "f1"])
+             in uniqified info ==> admitted (foldr define predicate definitions) === admitted (Solution.lhsPred cfg scope mempty info solution constraint)
+  where
+    probes =
+        [ F.PTrue
+        , F.EEq (var "n0") (int 0)
+        , F.EEq (F.ECst (int 0) (F.FObj "n1")) (int 0)
+        , F.EEq (F.ECst (int 0) (F.FObj "n2")) (int 0)
+        , F.PAtom F.Gt (var "n3") (int 0)
+        ]
+    actual = F.PAnd <$> vectorOf 2 (elements probes)
+    placements = (,,) <$> vectorOf (length placementPool) (sublistOf [0, 1, 2]) <*> actual <*> actual
+
+placementPool :: [(F.Symbol, F.Sort)]
+placementPool = [("n0", F.FInt), ("n1", F.FNum), ("n2", F.FFrac), ("n3", F.FObj "n1")]
+
+-- | The sites (0 the occurrence, 1 $k0's cube, 2 $k1's cube) that bind each
+-- pool name, and the actuals of $k0's and $k1's cubes.
+placementQuery :: ([[Int]], F.Expr, F.Expr) -> Fixture
+placementQuery (placed, outerActual, nestedActual) = (info, solution, F.SimpC (ids 0 [90]) F.PTrue (Just 99) 90 [] ())
+  where
+    declared site = [(10 * site + index, name, sort) | ((name, sort), index, sites) <- zip3 placementPool [0 ..] placed, site `elem` sites]
+    ids site extra = F.fromListIBindEnv (extra ++ [i | (i, _, _) <- declared site])
+    bindings =
+        F.bindEnvFromList $
+            [binding i name sort F.PTrue | site <- [0, 1, 2], (i, name, sort) <- declared site]
+                ++ [ binding 90 "target" F.boolSort (F.PKVar (kvar 0) mempty mempty)
+                   , binding 91 "inner" F.boolSort (F.PKVar (kvar 1) mempty mempty)
+                   , binding 92 "f0" F.boolSort F.PTrue
+                   , binding 93 "f1" F.boolSort F.PTrue
+                   ]
+    info = mempty{F.bs = bindings, F.ws = M.fromList [(kvar index, F.WfC mempty [(formal, F.boolSort)] (kvar index) ()) | (index, formal) <- [(0, "f0"), (1, "f1")]]}
+    outer = Sol.Cube (ids 1 [91]) (F.mkSubst [("f0", outerActual)]) 0 []
+    nested = Sol.Cube (ids 2 []) (F.mkSubst [("f1", nestedActual)]) 1 []
+    solution = Sol.Sol mempty (M.fromList [(kvar 0, [outer]), (kvar 1, [nested])]) (M.fromList [(kvar 0, mempty), (kvar 1, mempty)])
+
+-- | A name bound with two sorts is outside the domain of the laws above:
+-- 'renameAll' renames such bindings apart, and the solver's 'symbolEnv',
+-- prepared before elaboration, rejects any that remain.
+multiSortedQueries :: Assertion
+multiSortedQueries =
+    forM_ cases $ \(label, bindings) -> do
+        let info = (mempty :: F.SInfo ()){F.bs = F.bindEnvFromList bindings}
+        assertBool label (not (uniqified info))
+        mustThrow (evaluate (force (F.seSort (Sanitize.symbolEnv cfg info))))
+  where
+    cases =
+        [ ("duplicate declaration", [binding 1 "x" F.FInt F.PTrue, binding 2 "x" F.boolSort F.PTrue])
+        , ("split numeric declaration", [binding 0 "alpha" F.FNum F.PTrue, binding 5 "alpha" F.FFrac F.PTrue])
+        , ("nested binding masks the occurrence's declaration", [binding 0 "alpha" F.FNum F.PTrue, binding 5 "alpha" F.FFrac F.PTrue, binding 6 "alpha" F.FNum F.PTrue])
+        ]
 
 inventorySolutions :: Assertion
 inventorySolutions = do
@@ -1019,6 +1098,7 @@ specializedCapabilityAdmission numericFirst = do
     let declarations = F.fromListSEnv [("element", F.FNum), ("a", F.FInt)]
         admitted = So.sortExprE Nothing F.dummySpan declarations mempty actual
     assertBool "original actual must be admitted under its numeric declaration" (either (const False) (== F.boolSort) admitted)
+    assertBool "the query is uniqified" (uniqified info)
     direct <- valid fixture [] (Solution.lhsPred cfg scope mempty info solution constraint)
     shared <- valid fixture definitions predicate
     assertEqual "direct reconstruction has the independently expected verdict" numericFirst direct

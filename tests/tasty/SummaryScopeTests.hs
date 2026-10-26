@@ -3,7 +3,6 @@
 module SummaryScopeTests (tests) where
 
 import Control.Monad (forM_)
-import qualified Data.Generics as Generics
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
 import EliminatedSharingSupport
@@ -60,21 +59,69 @@ tests =
                , let label = "unobserved qualifier is not demanded " ++ show guarded
                ]
             ++ [testProperty "observed sort names match their generic reference" sortNamesAgree]
+            ++ [ testCase label (check label expected True (cachedCapture disjunction))
+               | (disjunction, expected) <- [(False, False), (True, True)]
+               , let label = "cached definition beneath a same-spelled Bool binder " ++ show disjunction
+               ]
+            ++ [testCase "outer actual sees the occurrence's declaration a nested cube rebinds" (check "nested-only declaration" True True nestedOnly)]
         )
 
--- | The structural sort-name fold against the generic traversal it replaces,
+-- | A cached zero-arity summary reused beneath a lexical Bool binder spelled
+-- like it. Both readings are well-sorted, so capture changes the verdict
+-- instead of making the query ill-sorted: the conjunction's binder would read
+-- the cached true body as itself, the disjunction's the cached false body.
+cachedCapture :: Bool -> Fixture
+cachedCapture disjunction = (info, solution, constraint)
+  where
+    name = F.tempSymbol "eliminated_summary" (0 :: Integer)
+    occurrence = F.PKVar (kvar 0) mempty mempty
+    target
+        | disjunction = F.POr [occurrence, F.PExist [(name, F.boolSort)] (F.PAnd [var name, occurrence])]
+        | otherwise = F.PAnd [occurrence, F.PExist [(name, F.boolSort)] (F.PAnd [F.PNot (var name), occurrence])]
+    bindings =
+        F.bindEnvFromList
+            [ binding 0 "y0" F.boolSort (if disjunction then F.PFalse else F.PTrue)
+            , binding 1 "v0" F.boolSort F.PTrue
+            , binding 2 "target" F.boolSort target
+            ]
+    info = mempty{F.bs = bindings, F.ws = M.singleton (kvar 0) (F.WfC mempty [("v0", F.boolSort)] (kvar 0) ())}
+    cube = Sol.Cube (F.fromListIBindEnv [0]) mempty 0 []
+    solution = Sol.Sol mempty (M.singleton (kvar 0) [cube]) (M.singleton (kvar 0) mempty)
+    constraint = F.SimpC (F.fromListIBindEnv [2]) F.PFalse (Just 99) 2 [] ()
+
+-- | alpha (one sort, Int) is declared at the occurrence (0) and in the nested
+-- cube of $k1 (1), but not in $k0's defining cube, whose actual casts to
+-- alpha. The outer actual is admitted where the occurrence's declaration is
+-- in scope and the nested cube's is not, so it gives w = 0.
+nestedOnly :: Fixture
+nestedOnly = (info, solution, constraint)
+  where
+    bindings =
+        F.bindEnvFromList
+            [ binding 0 "alpha" F.FInt F.PTrue
+            , binding 1 "alpha" F.FInt F.PTrue
+            , binding 2 "z" F.FInt F.PTrue
+            , binding 3 "w" F.FInt F.PTrue
+            , binding 4 "target" F.boolSort (F.PKVar (kvar 0) mempty (F.mkKVarSubst [("z", var "w")]))
+            , binding 5 "inner" F.boolSort (F.PKVar (kvar 1) mempty mempty)
+            , binding 6 "r" (F.FObj "alpha") F.PTrue
+            , binding 7 "z1" F.FInt F.PTrue
+            ]
+    actual = F.EBin F.Mod (F.ECst (int 0) (F.FObj "alpha")) (int 1)
+    outer = Sol.Cube (F.fromListIBindEnv [5]) (F.mkSubst [("z", actual)]) 0 []
+    nested = Sol.Cube (F.fromListIBindEnv [1, 6]) mempty 1 []
+    info = mempty{F.bs = bindings, F.ws = M.fromList [(kvar 0, F.WfC mempty [("z", F.FInt)] (kvar 0) ()), (kvar 1, F.WfC mempty [("z1", F.FInt)] (kvar 1) ())]}
+    solution = Sol.Sol mempty (M.fromList [(kvar 0, [outer]), (kvar 1, [nested])]) (M.fromList [(kvar 0, mempty), (kvar 1, mempty)])
+    constraint = F.SimpC (F.fromListIBindEnv [0, 3, 4]) (F.EEq (var "w") (int 0)) (Just 99) 4 [] ()
+
+-- | The structural sort-name fold against the generic traversal it replaced,
 -- on expressions whose type binders, sort names and KVar type actuals share a
 -- three-name pool, so a binder captures names in every position.
 sortNamesAgree :: Property
 sortNamesAgree =
     withMaxSuccess 2000 $
         forAll (sized poolExpr) $ \expression ->
-            Solution.expressionSortNames expression
-                === (V.exprFreeSortNames expression `S.union` Generics.everything S.union (Generics.mkQ S.empty actuals) expression)
-  where
-    actuals :: F.Expr -> S.HashSet F.Symbol
-    actuals (F.PKVar _ types _) = S.unions (map F.sortSymbols (M.elems types))
-    actuals _ = S.empty
+            V.exprFreeSortNames expression === genericSortNames expression
 
 poolName :: Gen F.Symbol
 poolName = elements ["a", "b", "c"]

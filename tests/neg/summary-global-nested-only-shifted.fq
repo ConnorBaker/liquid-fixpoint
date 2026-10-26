@@ -1,0 +1,37 @@
+// tests/elim/summary-global-nested-only.fq with a goal that the occurrence's
+// declaration of g does not give: w = g + 1 must stay UNSAFE.
+constant g : (int)
+
+bind 0 g : {v : int | true}
+bind 1 g : {v : int | true}
+bind 2 z : {v : int | true}
+bind 3 w : {v : int | true}
+bind 4 p : {v : int | $k0[z := w][v := p]}
+bind 5 q : {v : int | $k1[v := q]}
+bind 6 r : {v : int | v = g}
+
+constraint:
+  env [1; 6]
+  lhs {v : int | v = r}
+  rhs {v : int | $k1}
+  id 1 tag []
+
+constraint:
+  env [5]
+  lhs {v : int | v = q}
+  rhs {v : int | $k0[z := g]}
+  id 2 tag []
+
+constraint:
+  env [0; 3; 4]
+  lhs {v : int | v = p}
+  rhs {v : int | w = g + 1}
+  id 3 tag []
+
+wf:
+  env [2]
+  reft {v : int | $k0}
+
+wf:
+  env [ ]
+  reft {v : int | $k1}

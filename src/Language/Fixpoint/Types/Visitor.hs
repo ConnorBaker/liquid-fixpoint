@@ -60,7 +60,6 @@ import qualified Data.HashMap.Strict as M
 import qualified Data.IntMap.Strict  as IM
 import qualified Data.List           as L
 import qualified Data.Generics       as G
-import qualified Data.Text           as T
 import           Language.Fixpoint.Types hiding (mapSort)
 import qualified Language.Fixpoint.Misc as Misc
 import Control.Monad.Reader
@@ -550,17 +549,37 @@ Only that type-binding case demands the expression/image name inventory;
 declaration names are checked by lookup, never enumerated.
 -}
 exprFreeSortNames :: Expr -> S.HashSet Symbol
-exprFreeSortNames = G.everythingBut S.union (G.mkQ (S.empty, False) sorts `G.extQ` scope `G.extQ` symbol `G.extQ` text)
+exprFreeSortNames = go S.empty
   where
-    sorts :: Sort -> (S.HashSet Symbol, Bool)
-    sorts sort = (sortSymbols sort, True)
-    scope :: Expr -> (S.HashSet Symbol, Bool)
-    scope (ETAbs body name) = (S.delete name (exprFreeSortNames body), True)
-    scope _ = (S.empty, False)
-    symbol :: Symbol -> (S.HashSet Symbol, Bool)
-    symbol _ = (S.empty, True)
-    text :: T.Text -> (S.HashSet Symbol, Bool)
-    text _ = (S.empty, True)
+    -- One structural pass: a generic traversal of every binding a summary
+    -- observes dominated the observation of large queries.
+    sorts bound sort
+        | S.null bound = sortSymbols sort
+        | otherwise = sortSymbols sort `S.difference` bound
+    go bound expression = case expression of
+        ESym _ -> S.empty
+        ECon (L _ sort) -> sorts bound sort
+        ECon _ -> S.empty
+        EVar _ -> S.empty
+        EApp function argument -> go bound function `S.union` go bound argument
+        ENeg body -> go bound body
+        EBin _ left right -> go bound left `S.union` go bound right
+        ELet _ value body -> go bound value `S.union` go bound body
+        EIte condition yes no -> S.unions [go bound condition, go bound yes, go bound no]
+        ECst body sort -> go bound body `S.union` sorts bound sort
+        ELam (_, sort) body -> sorts bound sort `S.union` go bound body
+        ETApp body sort -> go bound body `S.union` sorts bound sort
+        ETAbs body name -> go (S.insert name bound) body
+        PAnd conjuncts -> S.unions (map (go bound) conjuncts)
+        POr disjuncts -> S.unions (map (go bound) disjuncts)
+        PNot body -> go bound body
+        PImp left right -> go bound left `S.union` go bound right
+        PIff left right -> go bound left `S.union` go bound right
+        PAtom _ left right -> go bound left `S.union` go bound right
+        PKVar _ types actuals -> S.unions (map (sorts bound) (M.elems types) ++ map (go bound) (M.elems (fromKVarSubst actuals)))
+        PAll binders body -> S.unions (go bound body : [sorts bound sort | (_, sort) <- binders])
+        PExist binders body -> S.unions (go bound body : [sorts bound sort | (_, sort) <- binders])
+        ECoerc from to body -> S.unions [sorts bound from, sorts bound to, go bound body]
 
 applyCoSub :: SortSubst -> Expr -> Expr
 applyCoSub substitution expression

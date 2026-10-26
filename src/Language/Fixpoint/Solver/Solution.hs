@@ -24,7 +24,6 @@ module Language.Fixpoint.Solver.Solution
   , SummaryState
   , prepareSummaryState
   , observeSummaries
-  , expressionSortNames
   , lhsPredShared
 
   , nonCutsResult
@@ -380,7 +379,7 @@ lhsPred cfg scope bindingsInSmt info s c =
 
 -- Lambda-lift eliminated definitions for one fixed solution observation.
 -- Definitions are local to its SMT bracket, not shared across refinement steps.
-type SummaryKey = (F.KVar, Integer, [F.BindId], [(F.Symbol, F.Sort)], [(F.Symbol, F.Sort)])
+type SummaryKey = (F.KVar, Integer, [F.BindId], [(F.Symbol, F.Sort)])
 data SummaryState = SummaryState
     { summaryNext :: F.Symbol
     , summaryNames :: S.HashSet F.Symbol
@@ -395,7 +394,7 @@ data SummaryState = SummaryState
     -- ^ The sort indices of every recorded summary's declaration.
     , summaryProjections :: Maybe ProjectionMemo
     -- ^ Projections shared with the other observations of one query.
-    , summaryObserved :: Maybe (F.KVar -> Sol.Cube -> M.HashMap F.Symbol (S.HashSet F.BindId))
+    , summaryObserved :: Maybe (F.KVar -> Sol.Cube -> S.HashSet F.Symbol)
     -- ^ 'observedNames' for the query's eliminated KVars, shared by its observations.
     , summaryBindNames :: LazyMap.HashMap F.BindId (S.HashSet F.Symbol)
     -- ^ Each binding's observed names ('refinementNames'), computed at most once per query.
@@ -412,10 +411,12 @@ type CubeScope a = CombinedEnv a -> F.KVar -> Sol.Cube -> (CombinedEnv a, F.IBin
 -- occurrence's environment binds: it encloses every constraint of the KVar, so
 -- it stays a parameter, as upstream omits it. A constraint binds every common
 -- binder of the KVars it uses; an exported KVar occurs in an empty
--- environment, so it closes its complete environment.
-definingScope :: S.HashSet F.Symbol -> F.SInfo a -> Sol.Solution -> CubeScope a
-definingScope scope info solution environment variable cube =
-    ( (bindLocalSorts (symSorts environment enclosing) (combinedEnv info scope bindings (ceSpan environment) F.emptyIBindEnv mempty)){ceFixed = ceFixed environment}
+-- environment, so it closes its complete environment. The declared bindings
+-- only declare names for the cube's judgments: they are neither quantified
+-- nor interpreted.
+definingScope :: S.HashSet F.Symbol -> F.SInfo a -> Sol.Solution -> F.IBindEnv -> CubeScope a
+definingScope scope info solution declared environment variable cube =
+    ( (bindLocalSorts (symSorts environment enclosing) (combinedEnv info scope (F.unionIBindEnv declared bindings) (ceSpan environment) F.emptyIBindEnv mempty)){ceFixed = ceFixed environment}
     , F.diffIBindEnv bindings enclosing
     )
   where
@@ -425,70 +426,53 @@ definingScope scope info solution environment variable cube =
 
 -- | The scope of a summary within one observation. Upstream interprets a cube
 -- in its occurrence's environment extended with the cube's bindings, and a
--- nested cube in that environment extended with its own, so the occurrence
--- decides the declaration of every name the cube looks up. A summary's
--- meaning therefore depends on its occurrence only through the declarations
--- of the names the cube observes ('observedNames'), apart from name hygiene,
--- which 'sharedCube' checks at each reuse. Build and key the summary on its
--- defining scope ('definingScope') plus exactly the occurrence's bindings of
--- the observed names whose declaration they change: those where adding them
--- to the bindings of the name in the cube and in the nested cubes that observe
--- it changes the sort that upstream's order resolves. In a uniqified query a
--- name has one sort, so in well-formed output the occurrence changes nothing a
--- cube binds, and the key does not depend on the path to the occurrence.
-observedScope :: (F.KVar -> Sol.Cube -> M.HashMap F.Symbol (S.HashSet F.BindId)) -> S.HashSet F.Symbol -> F.SInfo a -> Sol.Solution -> CubeScope a
+-- nested cube in that environment extended with its own. In a uniqified query
+-- a name has one sort (bindings with conflicting sorts are renamed apart, and
+-- 'Sanitize.symbolEnv' rejects any that remain), so the occurrence cannot
+-- change a declaration the cube makes: a judgment of the cube can depend on
+-- the occurrence only through the names it looks up that the cube does not
+-- bind ('observedNames'), apart from name hygiene, which 'sharedCube' checks
+-- at each reuse. Sanitization admits such names: an actual may name a global
+-- constant that the occurrence's environment also binds. Declare exactly the
+-- occurrence's bindings of those names in the defining scope
+-- ('definingScope'), whose key then records them, together with its bindings
+-- of the sort names their sorts look up. A nested cube's scope is built from
+-- its enclosing cube's, which declares the names its nested cubes look up.
+-- When the occurrence declares none, the key does not depend on the path to
+-- the occurrence.
+observedScope :: (F.KVar -> Sol.Cube -> S.HashSet F.Symbol) -> S.HashSet F.Symbol -> F.SInfo a -> Sol.Solution -> CubeScope a
 observedScope observed scope info solution original variable cube =
-    ( defining
-        { ceDeclared = extra
-        , ceObservedKey = changed
-        , declarationSEnv = if F.nullIBindEnv extra then declarationSEnv defining else declarationsOf info (F.unionIBindEnv extra (ceIEnv defining))
-        , ceNameIds = if F.nullIBindEnv extra then ceNameIds defining else nameIdsOf info (F.unionIBindEnv extra (ceIEnv defining))
-        }
-    , bindings
-    )
+    definingScope scope info solution (declare F.emptyIBindEnv (observed variable cube)) original variable cube
   where
-    (defining, bindings) = definingScope scope info solution original variable cube
-    -- Upstream's declaration of a name is that of its last binding in the
-    -- extended environment's order, which every subset of it preserves.
-    resolve ids = case F.elemsIBindEnv (F.fromListIBindEnv ids) of
-        [] -> Nothing
-        ordered -> let (_, refinement, _) = F.lookupBindEnv (last ordered) (F.bs info) in Just (F.sr_sort refinement)
-    changed =
-        List.sort
-            [ (name, sort)
-            | (name, (nested, occurrence)) <- M.toList (M.intersectionWith (,) (observed variable cube) (ceNameIds original))
-            , let own = M.lookupDefault [] name (ceNameIds defining) ++ S.toList nested
-            , Just sort <- [resolve (occurrence ++ own)]
-            , resolve own /= Just sort
-            ]
-    extra = F.fromListIBindEnv [i | (name, _) <- changed, i <- M.lookupDefault [] name (ceNameIds original)]
+    declare declared names
+        | F.nullIBindEnv new = declared
+        | otherwise = declare (F.unionIBindEnv declared new) (S.unions [F.sortSymbols (F.sr_sort refinement) | (_, refinement) <- F.envCs (F.bs info) new])
+      where
+        new = F.fromListIBindEnv [i | name <- S.toList names, i <- M.lookupDefault [] name (ceNameIds original), not (F.memberIBindEnv i declared)]
 
--- | Every name a cube's interpretation can look up in an environment: the free
--- term and sort names of its bindings and substitution (including its
--- formals), and those of the cubes of every eliminated KVar it uses, each with
--- the bindings of it in those nested cubes, which take part in its resolution
--- there. Each entry is computed at most once per observation.
-observedNames :: LazyMap.HashMap F.BindId (S.HashSet F.Symbol) -> F.SInfo a -> Sol.Solution -> F.KVar -> Sol.Cube -> M.HashMap F.Symbol (S.HashSet F.BindId)
+-- | The names a cube's interpretation can look up in an environment but does
+-- not bind: the free term and sort names of its bindings and substitution,
+-- and those of the cubes of every eliminated KVar it uses, less the names of
+-- its own bindings. Each entry is computed at most once per observation.
+observedNames :: LazyMap.HashMap F.BindId (S.HashSet F.Symbol) -> F.SInfo a -> Sol.Solution -> F.KVar -> Sol.Cube -> S.HashSet F.Symbol
 observedNames bindingNames info solution = \variable cube -> LazyMap.lookupDefault (names cube) (variable, Sol.cuId cube) table
   where
     table = LazyMap.fromList [((variable, Sol.cuId cube), names cube) | (variable, cubes) <- M.toList (Sol.sHyp solution), cube <- cubes]
     names cube =
-        List.foldl' (M.unionWith S.union) M.empty $
-            M.fromList [(name, S.empty) | name <- S.toList direct]
-                : [ M.mapWithKey (\name ids -> ids `S.union` S.fromList (M.lookupDefault [] name innerIds)) (LazyMap.lookupDefault M.empty (nested, Sol.cuId inner) table)
-                  | expression <- map (F.reftPred . F.sr_reft . snd) bindings ++ M.elems substitution
-                  , nested <- V.kvarsExpr expression
-                  , Left cubes <- [Sol.lookup solution nested]
-                  , inner <- cubes
-                  , let innerIds = nameIdsOf info (Sol.cuBinds inner)
-                  ]
+        S.unions
+            ( [LazyMap.lookupDefault S.empty i bindingNames | i <- F.elemsIBindEnv (Sol.cuBinds cube)]
+                ++ map expressionNames (M.elems substitution)
+                ++ [ LazyMap.lookupDefault S.empty (nested, Sol.cuId inner) table
+                   | expression <- map (F.reftPred . F.sr_reft . snd) bindings ++ M.elems substitution
+                   , nested <- V.kvarsExpr expression
+                   , Left cubes <- [Sol.lookup solution nested]
+                   , inner <- cubes
+                   ]
+            )
+            `S.difference` S.fromList (map fst bindings)
       where
         bindings = F.envCs (F.bs info) (Sol.cuBinds cube)
         F.Su substitution = Sol.cuSubst cube
-        direct =
-            S.unions $
-                [LazyMap.lookupDefault S.empty i bindingNames | i <- F.elemsIBindEnv (Sol.cuBinds cube)]
-                    ++ [S.insert formal (expressionNames value) | (formal, value) <- M.toList substitution]
 
 -- | The free term and sort names a refinement's interpretation can look up.
 refinementNames :: F.SortedReft -> S.HashSet F.Symbol
@@ -497,42 +481,7 @@ refinementNames refinement = F.sortSymbols (F.sr_sort refinement) `S.union` expr
 -- | The free term and sort names an expression's interpretation can look up,
 -- including the sorts of its KVar occurrences' type actuals.
 expressionNames :: F.Expr -> S.HashSet F.Symbol
-expressionNames expression = F.exprSymbolsSet expression `S.union` expressionSortNames expression
-
--- | 'V.exprFreeSortNames' together with every sort name of the expression's
--- KVar occurrences' type actuals, bound or not, in one structural pass: a
--- generic traversal of each observed binding dominated the observation of
--- large queries.
-expressionSortNames :: F.Expr -> S.HashSet F.Symbol
-expressionSortNames = go S.empty
-  where
-    sorts bound sort
-        | S.null bound = F.sortSymbols sort
-        | otherwise = F.sortSymbols sort `S.difference` bound
-    go bound expression = case expression of
-        F.ESym _ -> S.empty
-        F.ECon (F.L _ sort) -> sorts bound sort
-        F.ECon _ -> S.empty
-        F.EVar _ -> S.empty
-        F.EApp function argument -> go bound function `S.union` go bound argument
-        F.ENeg body -> go bound body
-        F.EBin _ left right -> go bound left `S.union` go bound right
-        F.ELet _ value body -> go bound value `S.union` go bound body
-        F.EIte condition yes no -> S.unions [go bound condition, go bound yes, go bound no]
-        F.ECst body sort -> go bound body `S.union` sorts bound sort
-        F.ELam (_, sort) body -> sorts bound sort `S.union` go bound body
-        F.ETApp body sort -> go bound body `S.union` sorts bound sort
-        F.ETAbs body name -> go (S.insert name bound) body
-        F.PAnd conjuncts -> S.unions (map (go bound) conjuncts)
-        F.POr disjuncts -> S.unions (map (go bound) disjuncts)
-        F.PNot body -> go bound body
-        F.PImp left right -> go bound left `S.union` go bound right
-        F.PIff left right -> go bound left `S.union` go bound right
-        F.PAtom _ left right -> go bound left `S.union` go bound right
-        F.PKVar _ types actuals -> S.unions (map F.sortSymbols (M.elems types) ++ map (go bound) (M.elems (F.fromKVarSubst actuals)))
-        F.PAll binders body -> S.unions (go bound body : [sorts bound sort | (_, sort) <- binders])
-        F.PExist binders body -> S.unions (go bound body : [sorts bound sort | (_, sort) <- binders])
-        F.ECoerc from to body -> S.unions [sorts bound from, sorts bound to, go bound body]
+expressionNames expression = F.exprSymbolsSet expression `S.union` V.exprFreeSortNames expression
 
 {- | Index declarations once for a fixed, elaborated solver query. Each
 observation reserves the lexical scopes and bodies it actually interprets;
@@ -728,7 +677,6 @@ sharedCube select cfg original solution occurrence cube = do
             , Sol.cuId cube
             , ids
             , locals
-            , ceObservedKey environment
             )
     cached <- St.gets (Ordered.lookup key . summaryCubes)
     bodies <- St.gets summaryBodies
@@ -831,27 +779,18 @@ data CombinedEnv a = CEnv
     , ceFixed :: S.HashSet F.Symbol
     , declarationSEnv :: F.SEnv F.Sort
     , ceScopeKey :: ([F.BindId], [(F.Symbol, F.Sort)])
-    , ceDeclared :: !F.IBindEnv
-    -- ^ Occurrence bindings whose declarations the cube observes ('observedScope').
-    , ceObservedKey :: [(F.Symbol, F.Sort)]
-    -- ^ The declarations those bindings change, for the summary key.
     , ceNameIds :: M.HashMap F.Symbol [F.BindId]
-    -- ^ The bindings of each name among 'ceIEnv' and 'ceDeclared', built on demand.
+    -- ^ The bindings of each name in 'ceIEnv', built on demand.
     }
 
 -- Declaration lookup and canonical identity belong to the scope, not each use.
 -- Keep these projections lazy when an observation does not need them.
 combinedEnv :: F.SInfo a -> S.HashSet F.Symbol -> F.IBindEnv -> F.SrcSpan -> F.IBindEnv -> F.SEnv F.Sort -> CombinedEnv a
 combinedEnv info scope ids location known locals =
-    CEnv info scope ids location known locals (fixedSymbols info) (declarationsOf info ids) (List.sort (F.elemsIBindEnv ids), List.sort (F.toListSEnv locals)) F.emptyIBindEnv [] (nameIdsOf info ids)
-
--- | The bindings of each name, in binding order.
-nameIdsOf :: F.SInfo a -> F.IBindEnv -> M.HashMap F.Symbol [F.BindId]
-nameIdsOf info ids = M.fromListWith (flip (++)) [(name, [i]) | i <- F.elemsIBindEnv ids, let (name, _, _) = F.lookupBindEnv i (F.bs info)]
-
--- | Declarations of bindings, a later binding of a name taking precedence.
-declarationsOf :: F.SInfo a -> F.IBindEnv -> F.SEnv F.Sort
-declarationsOf info ids = F.sr_sort <$> F.fromListSEnv (F.envCs (F.bs info) ids)
+    CEnv info scope ids location known locals (fixedSymbols info) declarations (List.sort (F.elemsIBindEnv ids), List.sort (F.toListSEnv locals)) names
+  where
+    declarations = F.sr_sort <$> F.fromListSEnv (F.envCs (F.bs info) ids)
+    names = M.fromListWith (flip (++)) [(name, [i]) | i <- F.elemsIBindEnv ids, let (name, _, _) = F.lookupBindEnv i (F.bs info)]
 
 -- | Explicit query declarations own their names even when BindEnv repeats
 -- them. Ambient built-ins are not declarations of a query-local witness.
@@ -970,7 +909,7 @@ nonCutsResult cfg scope info solution = M.mapWithKey (\variable _ -> Delayed (ex
     initial = (prepareSummaryState scope info){summaryProjections = Just (newProjectionMemo solution)}
     export variable =
         let occurrence = F.KVS (F.vv Nothing) F.boolSort variable (F.toKVarSubst M.empty) mempty
-            (predicate, final) = St.runState (sharedKVar (definingScope scope info solution) cfg g solution occurrence) initial
+            (predicate, final) = St.runState (sharedKVar (definingScope scope info solution F.emptyIBindEnv) cfg g solution occurrence) initial
             exported = bindSummaries (summaryBodies final <> definitions) (F.syms predicate) predicate
             own = S.fromList (F.kvarDomain info variable)
             foreign = (F.syms exported `S.intersection` summaryFormals initial) `S.difference` own
@@ -1072,12 +1011,10 @@ combinedSEnv :: CombinedEnv a -> F.SEnv F.Sort
 combinedSEnv g = ceLocalSorts g <> declarationSEnv g
 
 addCEnv :: CombinedEnv a -> F.IBindEnv -> CombinedEnv a
-addCEnv g bs'
-    | F.nullIBindEnv (ceDeclared g) = extended
-    | otherwise = extended{ceDeclared = ceDeclared g, declarationSEnv = declarationsOf (ceInfo g) (F.unionIBindEnv (ceDeclared g) ids), ceNameIds = nameIdsOf (ceInfo g) (F.unionIBindEnv (ceDeclared g) ids)}
-  where
-    ids = F.unionIBindEnv (ceIEnv g) bs'
-    extended = (combinedEnv (ceInfo g) (ceInScope g) ids (ceSpan g) (ceBindingsInSmt g) (ceLocalSorts g)){ceFixed = ceFixed g}
+addCEnv g bs' =
+    (combinedEnv (ceInfo g) (ceInScope g) (F.unionIBindEnv (ceIEnv g) bs') (ceSpan g) (ceBindingsInSmt g) (ceLocalSorts g))
+        { ceFixed = ceFixed g
+        }
 
 symSorts :: CombinedEnv a -> F.IBindEnv -> [(F.Symbol, F.Sort)]
 symSorts g bs = [(name, F.sr_sort refinement) | (name, refinement) <- F.envCs (F.bs (ceInfo g)) bs, not (S.member name (ceFixed g))]

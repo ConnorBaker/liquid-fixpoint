@@ -1,0 +1,28 @@
+// g is a global constant that the BindEnv also binds (bind 0; first-order,
+// so sanitization keeps it). $k0's defining cube (constraint 1) does not bind
+// g, but its actual names it, which sanitization admits because g is global.
+// Interpreted in the occurrence's environment extended with the cube's, as
+// upstream interprets a cube, the actual is admitted under the occurrence's
+// declaration of g, so w = g. The shared summary must declare it too.
+constant g : (int)
+
+bind 0 g : {v : int | true}
+bind 1 z : {v : int | true}
+bind 2 w : {v : int | true}
+bind 3 p : {v : int | $k0[z := w][v := p]}
+
+constraint:
+  env [ ]
+  lhs {v : int | true}
+  rhs {v : int | $k0[z := g]}
+  id 1 tag []
+
+constraint:
+  env [0; 2; 3]
+  lhs {v : int | v = p}
+  rhs {v : int | w = g}
+  id 2 tag []
+
+wf:
+  env [1]
+  reft {v : int | $k0}
