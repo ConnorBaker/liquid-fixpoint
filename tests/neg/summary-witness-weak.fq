@@ -1,0 +1,21 @@
+// UNSAFE: tests/elim/summary-witness.fq with the witnessed fact weakened to x >= 0, so
+// the summary that carries it no longer implies the goal v > 0.
+
+bind 0 x : {v : int | v >= 0}
+bind 1 y : {v : int | $k0[v:=y]}
+
+constraint:
+  env [0]
+  lhs {v : int | v = x}
+  rhs {v : int | $k0}
+  id 1 tag []
+
+constraint:
+  env [1]
+  lhs {v : int | v = y}
+  rhs {v : int | v > 0}
+  id 2 tag []
+
+wf:
+  env [ ]
+  reft {v : int | $k0}

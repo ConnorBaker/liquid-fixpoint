@@ -3,14 +3,17 @@
 module SummaryScopeTests (tests) where
 
 import Control.Monad (forM_)
+import qualified Data.Generics as Generics
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
 import EliminatedSharingSupport
 import qualified Language.Fixpoint.Solver.Solution as Solution
 import qualified Language.Fixpoint.Types as F
 import qualified Language.Fixpoint.Types.Solutions as Sol
+import qualified Language.Fixpoint.Types.Visitor as V
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, testCase, (@?=))
+import Test.Tasty.QuickCheck (Gen, Property, choose, elements, forAll, oneof, sized, testProperty, vectorOf, withMaxSuccess, (===))
 
 tests :: TestTree
 tests =
@@ -56,7 +59,64 @@ tests =
                | guarded <- [False, True]
                , let label = "unobserved qualifier is not demanded " ++ show guarded
                ]
+            ++ [testProperty "observed sort names match their generic reference" sortNamesAgree]
         )
+
+-- | The structural sort-name fold against the generic traversal it replaces,
+-- on expressions whose type binders, sort names and KVar type actuals share a
+-- three-name pool, so a binder captures names in every position.
+sortNamesAgree :: Property
+sortNamesAgree =
+    withMaxSuccess 2000 $
+        forAll (sized poolExpr) $ \expression ->
+            Solution.expressionSortNames expression
+                === (V.exprFreeSortNames expression `S.union` Generics.everything S.union (Generics.mkQ S.empty actuals) expression)
+  where
+    actuals :: F.Expr -> S.HashSet F.Symbol
+    actuals (F.PKVar _ types _) = S.unions (map F.sortSymbols (M.elems types))
+    actuals _ = S.empty
+
+poolName :: Gen F.Symbol
+poolName = elements ["a", "b", "c"]
+
+poolSort :: Int -> Gen F.Sort
+poolSort size
+    | size <= 1 = oneof [F.FObj <$> poolName, pure F.FInt]
+    | otherwise = oneof [F.FObj <$> poolName, pure F.FInt, F.FFunc <$> half <*> half, F.FApp <$> half <*> half, F.FAbs <$> choose (0, 2) <*> half]
+  where
+    half = poolSort (size `div` 2)
+
+poolExpr :: Int -> Gen F.Expr
+poolExpr size
+    | size <= 1 = leaf
+    | otherwise =
+        oneof
+            [ leaf
+            , F.EApp <$> sub <*> sub
+            , F.ENeg <$> sub
+            , F.EBin F.Plus <$> sub <*> sub
+            , F.ELet <$> poolName <*> sub <*> sub
+            , F.EIte <$> sub <*> sub <*> sub
+            , F.ECst <$> sub <*> sort
+            , F.ELam <$> ((,) <$> poolName <*> sort) <*> sub
+            , F.ETApp <$> sub <*> sort
+            , F.ETAbs <$> sub <*> poolName
+            , F.PAnd <$> some sub
+            , F.POr <$> some sub
+            , F.PNot <$> sub
+            , F.PImp <$> sub <*> sub
+            , F.PIff <$> sub <*> sub
+            , F.PAtom F.Eq <$> sub <*> sub
+            , F.PKVar (kvar 0) <$> (M.fromList <$> some ((,) <$> poolName <*> sort)) <*> (F.toKVarSubst . M.fromList <$> some ((,) <$> poolName <*> sub))
+            , F.PAll <$> some ((,) <$> poolName <*> sort) <*> sub
+            , F.PExist <$> some ((,) <$> poolName <*> sort) <*> sub
+            , F.ECoerc <$> sort <*> sort <*> sub
+            ]
+  where
+    leaf = oneof [F.EVar <$> poolName, F.ECon . F.L "literal" <$> poolSort 2, pure (F.ECon (F.I 0)), pure (F.ESym (F.SL "constant"))]
+    sub = poolExpr (size `div` 2)
+    sort = poolSort 4
+    some generator = choose (0, 2) >>= (`vectorOf` generator)
 
 observed :: String -> Bool -> Fixture -> Assertion
 observed label expected fixture = do

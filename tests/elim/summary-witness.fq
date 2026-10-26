@@ -1,0 +1,21 @@
+// The constraint's goal needs a fact (x > 0) of a binding that is not in its
+// environment and reaches it only through the eliminated $k0's summary.
+
+bind 0 x : {v : int | v > 0}
+bind 1 y : {v : int | $k0[v:=y]}
+
+constraint:
+  env [0]
+  lhs {v : int | v = x}
+  rhs {v : int | $k0}
+  id 1 tag []
+
+constraint:
+  env [1]
+  lhs {v : int | v = y}
+  rhs {v : int | v > 0}
+  id 2 tag []
+
+wf:
+  env [ ]
+  reft {v : int | $k0}

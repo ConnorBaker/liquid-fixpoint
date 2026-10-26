@@ -1,0 +1,31 @@
+// UNSAFE: tests/elim/summary-occurrence-actuals.fq with the second goal
+// swapped to v > 1, which holds for the first occurrence's actual (a > 0) but
+// not for its own (b < 0).
+
+bind 0 z : {v : int | true}
+bind 1 a : {v : int | v > 0}
+bind 2 b : {v : int | v < 0}
+bind 3 p : {v : int | $k0[z:=a][v:=p]}
+bind 4 q : {v : int | $k0[z:=b][v:=q]}
+
+constraint:
+  env [0]
+  lhs {v : int | v = z + 1}
+  rhs {v : int | $k0}
+  id 1 tag []
+
+constraint:
+  env [1; 3]
+  lhs {v : int | v = p}
+  rhs {v : int | v > 1}
+  id 2 tag []
+
+constraint:
+  env [2; 4]
+  lhs {v : int | v = q}
+  rhs {v : int | v > 1}
+  id 3 tag []
+
+wf:
+  env [0]
+  reft {v : int | $k0}

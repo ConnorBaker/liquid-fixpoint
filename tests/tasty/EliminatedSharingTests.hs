@@ -142,6 +142,7 @@ tests =
                            ]
                     )
                , testCase "repeated observations share the query inventory" inventoryAllocation
+               , testCaseInfo "observed binding names are one structural pass" observedNamesAllocation
                , testGroup
                     "repeated actuals share their declaration scope"
                     [testCaseInfo ("explicit KVars: " ++ show explicit) (declarationAllocation explicit) | explicit <- [False, True]]
@@ -280,6 +281,42 @@ inventoryAllocation = do
     let reference = Solution.lhsPredShared config (Solution.prepareSummaryState scope originalInfo) scope mempty originalInfo solution constraint
     mapM_ (@?= reference) results
     assertBool ("repeated whole-query inventory allocation: " ++ show bytes) (bytes < 64 * 1024 * 1024)
+
+-- | Naming the bindings a cube observes is one structural pass over their
+-- refinements: a generic traversal of every observed binding dominated
+-- observing large queries. The reference is one such traversal of the large
+-- witness's refinement, a single atom so the rest of the observation stays
+-- linear in its size.
+observedNamesAllocation :: IO String
+observedNamesAllocation = do
+    _ <- evaluate (force (small, large))
+    generic <- allocationBytes (V.exprFreeSortNames large)
+    smallBytes <- observe small
+    largeBytes <- observe large
+    let message = "small/large observations and one generic traversal allocated " ++ show (smallBytes, largeBytes, generic)
+    assertBool message (largeBytes - smallBytes < generic)
+    pure message
+  where
+    sum' low high
+        | low == high = F.ECst (F.EBin F.Plus (var "witness") (int low)) F.FInt
+        | otherwise = let middle = (low + high) `div` 2 in F.EBin F.Plus (sum' low middle) (sum' (middle + 1) high)
+    atom leaves = F.PAtom F.Ge (sum' 1 leaves) (int 0)
+    small = atom 1
+    large = atom 4096
+    observe refinement = do
+        let bindings = F.bindEnvFromList [binding 0 "formal" F.FInt F.PTrue, binding 1 "witness" F.FInt refinement, binding 2 "x" F.FInt F.PTrue, binding 3 "target" F.boolSort (F.PKVar (kvar 0) mempty (F.mkKVarSubst [("formal", var "x")]))]
+            info = mempty{F.bs = bindings, F.ws = M.singleton (kvar 0) (F.WfC mempty [("formal", F.FInt)] (kvar 0) ())}
+            cube = Sol.Cube (F.fromListIBindEnv [1]) (F.mkSubst [("formal", var "witness")]) 0 []
+            solution :: Sol.Solution
+            solution = Sol.Sol mempty (M.singleton (kvar 0) [cube]) (M.singleton (kvar 0) mempty)
+            constraint = F.SimpC (F.fromListIBindEnv [2, 3]) F.PTrue (Just 99) 3 [] ()
+            scope = S.fromList [name | (_, (name, _, _)) <- F.bindEnvToList bindings]
+            result = Solution.lhsPredShared cfg (Solution.prepareSummaryState scope info) scope mempty info solution constraint
+        _ <- evaluate (force (bindings, solution, constraint, scope))
+        bytes <- allocationBytes result
+        case result of
+            ([_], _) -> pure bytes
+            _ -> assertFailure "the witness was not summarized"
 
 declarationAllocation :: Bool -> IO String
 declarationAllocation explicit = do

@@ -204,7 +204,7 @@ refine
   -> SolveM a Sol.Solution
 --------------------------------------------------------------------------------
 refine scope bindingsInSmt info s0 w0 = do
-  let initial = S.prepareSummaryState scope info
+  let initial = S.observeSummaries info s0 (S.prepareSummaryState scope info)
   go initial s0 w0
  where
   go :: S.SummaryState -> Sol.Solution -> W.Worklist a -> SolveM a Sol.Solution
@@ -349,7 +349,7 @@ result_
   -> Sol.Solution
   -> SolveM a (F.FixResult (F.SimpC a))
 result_ scope bindingsInSmt info cfg cs0 s = do
-  let initial = S.prepareSummaryState scope info
+  let initial = S.observeSummaries info s (S.prepareSummaryState scope info)
   unsatisfiedConstraints <- filterM (isUnsat initial scope bindingsInSmt info s) cs
   sts <- stats
   pure $ res sts unsatisfiedConstraints

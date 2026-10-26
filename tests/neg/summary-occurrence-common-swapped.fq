@@ -1,0 +1,43 @@
+// UNSAFE: tests/elim/summary-occurrence-common.fq with the last goal swapped
+// to v > 0, which holds under the top-level occurrence's fact (g > 0) but not
+// under the fact of $k1's defining cube (g < 0).
+
+bind 0 g : {v : int | true}
+bind 1 x : {v : int | v = g}
+bind 2 h1 : {v : int | g > 0}
+bind 3 p : {v : int | $k0[v:=p]}
+bind 4 h2 : {v : int | g < 0}
+bind 5 q : {v : int | $k0[v:=q]}
+bind 6 r : {v : int | $k1[v:=r]}
+
+constraint:
+  env [0; 1]
+  lhs {v : int | v = x}
+  rhs {v : int | $k0}
+  id 1 tag []
+
+constraint:
+  env [0; 2; 3]
+  lhs {v : int | v = p}
+  rhs {v : int | v > 0}
+  id 2 tag []
+
+constraint:
+  env [0; 4; 5]
+  lhs {v : int | v = q}
+  rhs {v : int | $k1}
+  id 3 tag []
+
+constraint:
+  env [0; 6]
+  lhs {v : int | v = r}
+  rhs {v : int | v > 0}
+  id 4 tag []
+
+wf:
+  env [ ]
+  reft {v : int | $k0}
+
+wf:
+  env [ ]
+  reft {v : int | $k1}
