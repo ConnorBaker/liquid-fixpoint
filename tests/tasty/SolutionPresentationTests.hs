@@ -41,10 +41,17 @@ tests =
                     assertBool "four times the definitions must not square the wire size" (Bytes.length large < 5 * Bytes.length small)
         , -- LiquidHaskell prints solutions in its error contexts with pprint,
           -- in page mode, not with the saved file's LeftMode.
+          -- The layout may change only whitespace: the tokens must be the ones
+          -- the horizontal printer printed, captured from it (65fd562c), not
+          -- the current Doc rendered another way.
           testCase "printed lexical sharing has a linear page-mode size" $ do
             let printed depth = F.showpp (closure depth)
+            words (printed 2) @?= horizontalTokens
             assertBool "four times the definitions must not square the printed size" (length (printed 256) < 5 * length (printed 64))
-            words (printed 64) @?= words (PJ.renderStyle PJ.style{PJ.mode = PJ.OneLineMode} (F.pprint (closure 64)))
+        , -- closure's lambdas bind one formal each; an exported summary's bind
+          -- one per formal, so their order is part of the printed tokens.
+          testCase "printed lambda chains keep their binders' order" $
+            words (F.showpp binderChain) @?= horizontalBinderTokens
         , testGroup "ordered comparisons of a non-numeric carrier" $
             [ testCase ("presented " ++ label ++ " solution has its source operands") $ do
                 (solution, formals) <- solved sorted
@@ -113,6 +120,35 @@ save result observe = withSystemTempDirectory "solution-presentation" $ \directo
     let source = directory </> "Presentation.hs"
     Solution.saveSolution C.defConfig{C.save = True, C.srcFile = source} "" result
     Bytes.readFile (Files.tempFileName (source ++ ".fqout")) >>= observe
+
+-- @words (F.showpp (closure 2))@ as the printer before the let and lambda
+-- layout printed it, each body after its header on one run.
+horizontalTokens :: [String]
+horizontalTokens =
+    [ "(let)", "shared_predicate_0", "=", "lam", "argument_0", ":", "int", ".", "exists", "[witness_0", ":", "int]", "."
+    , "witness_0", "==", "argument_0", "&&", "argument_0", "==", "1"
+    , "in", "(let)", "shared_predicate_1", "=", "lam", "argument_1", ":", "int", ".", "exists", "[witness_1", ":", "int]", "."
+    , "witness_1", "==", "argument_1", "&&", "shared_predicate_0", "argument_1"
+    , "in", "shared_predicate_1", "1"
+    ]
+
+-- A let-bound chain of three lambdas, the shape an exported summary takes
+-- (one lambda per formal), applied to three arguments.
+binderChain :: F.Expr
+binderChain = F.ELet "f" (foldr lam body [0 .. 2 :: Int]) (foldl F.EApp (F.EVar "f") [F.ECon (F.I n) | n <- [1 .. 3]])
+  where
+    binder i = F.symbol ("x_" ++ show i)
+    lam i = F.ELam (binder i, F.FInt)
+    body = F.PAnd [F.PAtom F.Eq (F.EVar (binder 0)) (F.ECon (F.I 1)), F.PAtom F.Gt (F.EVar (binder 2)) (F.ECon (F.I 0))]
+
+-- @words (F.showpp binderChain)@ as the printer before the let and lambda
+-- layout printed it.
+horizontalBinderTokens :: [String]
+horizontalBinderTokens =
+    [ "(let)", "f", "=", "lam", "x_0", ":", "int", ".", "lam", "x_1", ":", "int", ".", "lam", "x_2", ":", "int", "."
+    , "x_0", "==", "1", "&&", "x_2", ">", "0"
+    , "in", "f", "1", "2", "3"
+    ]
 
 closure :: Int -> F.Expr
 closure depth = foldr define (F.EApp (F.EVar (name (depth - 1))) (F.ECon (F.I 1))) [0 .. depth - 1]
